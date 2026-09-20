@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
+import { resolveLocalDirectory } from './pathMapper';
 import { showSessionPreview } from './previewPanel';
 import { SessionRecord } from './sessionScanner';
 import { SyncController } from './syncController';
@@ -119,11 +120,31 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
         case 'resumeSession': {
           const record = this.findSession(message.id);
-          if (record) {
-            const terminal = vscode.window.createTerminal({ name: `OpenCode: ${record.title}`, cwd: record.directory || undefined });
-            terminal.show();
-            terminal.sendText(`opencode --session ${record.id}`);
+          if (!record) {
+            return;
           }
+
+          // Mirrors the cross-OS resolution the full "List All Sessions"
+          // flow does — without it, a session recorded on the other machine
+          // resumes with a cwd that doesn't exist here.
+          const directory = resolveLocalDirectory(record.directory, {
+            mappings: this.controller.getMappings(),
+            workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+            searchRoots: vscode.workspace
+              .getConfiguration('opencodeSessionHub')
+              .get<string[]>('projectSearchRoots', []),
+          });
+
+          if (!directory) {
+            vscode.window.showWarningMessage(
+              `"${record.directory || 'unknown'}" does not exist on this machine — use "OpenCode: List All Sessions" to pick a folder for it.`
+            );
+            return;
+          }
+
+          const terminal = vscode.window.createTerminal({ name: `OpenCode: ${record.title}`, cwd: directory });
+          terminal.show();
+          terminal.sendText(`opencode --session ${record.id}`);
           return;
         }
 
@@ -314,8 +335,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           '<div class="meta">' + escapeHtml(s.directory || 'unknown directory') + ' · ' +
           (s.updatedAt ? new Date(s.updatedAt).toLocaleString() : '') + ' · ' + s.messageCount + ' messages</div>' +
           '<div class="row">' +
-          '<button class="secondary" data-action="preview" data-id="' + s.id + '">Preview</button>' +
-          '<button class="secondary" data-action="resume" data-id="' + s.id + '">Resume</button>' +
+          '<button class="secondary" data-action="preview" data-id="' + escapeHtml(s.id) + '">Preview</button>' +
+          '<button class="secondary" data-action="resume" data-id="' + escapeHtml(s.id) + '">Resume</button>' +
           '</div></li>').join('') + '</ul>'
       : '<p class="empty">No sessions found yet.</p>';
 

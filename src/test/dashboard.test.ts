@@ -23,6 +23,7 @@ describe('sidebar dashboard', () => {
   let controller: InstanceType<typeof SyncController>;
   let posted: unknown[];
   let onMessage: (message: unknown) => void;
+  let demoDir: string;
 
   function context() {
     return { globalStorageUri: { fsPath: path.join(machine.home, 'globalStorage') } };
@@ -58,12 +59,14 @@ describe('sidebar dashboard', () => {
     remote = path.join(root, 'remote.git');
     spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
     machine = createMachine(root, 'work');
+    demoDir = path.join(root, 'demo-project');
+    fs.mkdirSync(demoDir, { recursive: true });
 
     addStorageSession(machine, {
       projectId: 'prj_a',
       sessionId: 'ses_dash1',
       title: 'Dashboard demo session',
-      worktree: '/work/demo',
+      worktree: demoDir,
     });
 
     stub = installVscodeStub();
@@ -160,8 +163,25 @@ describe('sidebar dashboard', () => {
     await onMessage({ type: 'resumeSession', id: 'ses_dash1' });
 
     assert.strictEqual(stub.terminals.length, 1);
-    assert.strictEqual(stub.terminals[0].cwd, '/work/demo');
+    assert.strictEqual(stub.terminals[0].cwd, demoDir);
     assert.deepStrictEqual(stub.terminals[0].sent, ['opencode --session ses_dash1']);
+  });
+
+  it('refuses to resume into a directory recorded on another machine instead of using it blindly', async () => {
+    addStorageSession(machine, {
+      projectId: 'prj_b',
+      sessionId: 'ses_foreign',
+      title: 'Foreign machine session',
+      worktree: 'C:\\Projetos\\meu-repo',
+    });
+    stub.terminals.length = 0;
+    stub.messages.length = 0;
+
+    await onMessage({ type: 'refresh' });
+    await onMessage({ type: 'resumeSession', id: 'ses_foreign' });
+
+    assert.strictEqual(stub.terminals.length, 0, 'must not open a terminal in a path that does not exist here');
+    assert.ok(stub.messages.some((m) => m.kind === 'warn' && m.text.includes('does not exist on this machine')));
   });
 
   it('preview opens a webview for the selected session', async () => {

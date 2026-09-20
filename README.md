@@ -69,7 +69,10 @@ Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
   session payloads before commit. Config files are never rewritten (a redacted
   `opencode.json` would be pushed and then applied on the other machine).
 - **Conflict resolution** — a real conflict is reported, not silently
-  discarded, and `OpenCode Sync: Resolve Conflicts` takes one side wholesale.
+  discarded. `OpenCode Sync: Resolve Conflicts` takes one side wholesale,
+  then finishes the interrupted sync: applies the resolution to the local
+  OpenCode directories and pushes it, so the conflict doesn't reappear on
+  the next sync.
 - **Handoff checkpoints** — a Markdown summary at `.opencode/HANDOFF.md`.
 - **Full-text search** across every session's messages.
 - **Status bar indicator** — synced / syncing / conflict / error / unconfigured.
@@ -94,7 +97,10 @@ Safety rules that apply on every sync:
   copied mid-write.
 - Session directories **merge** rather than mirror — files missing locally are
   never deleted from the repo, so one machine can't wipe the other's history.
-- A local file newer than the synced copy is never overwritten on pull.
+- A local file edited since this machine's last successful pull is never
+  overwritten by a later pull — protected against a stale sync clobbering
+  work in progress. The very first pull to a new machine (`/sync-link`) is
+  the deliberate exception: it adopts the remote unconditionally.
 
 ## Installing
 
@@ -179,7 +185,7 @@ if you need them:
 ```bash
 npm install
 npm run compile
-npm test        # 54 tests: storage scanning, sanitizer, path mapping,
+npm test        # 57 tests: storage scanning, sanitizer, path mapping,
                 # two-machine sync simulation, extension activation,
                 # sidebar dashboard message protocol
 ```

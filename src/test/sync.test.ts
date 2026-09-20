@@ -166,7 +166,7 @@ describe('two-machine sync simulation', () => {
     assert.deepStrictEqual(ids.sort(), ['ses_home1', 'ses_work1']);
   });
 
-  it('reports a conflict instead of silently discarding a side', async () => {
+  it('reports a conflict instead of silently discarding a side, then resolving finishes the sync', async () => {
     const a = managerFor(work);
     const b = managerFor(home);
 
@@ -177,12 +177,53 @@ describe('two-machine sync simulation', () => {
     fs.writeFileSync(path.join(home.configRoot, 'AGENTS.md'), '# from home\n', 'utf8');
     const conflicted = await b.push();
 
-    if (conflicted.status === 'conflict') {
-      const resolved = await b.resolveConflicts('remote');
-      assert.strictEqual(resolved.status, 'ok');
-    } else {
+    if (conflicted.status !== 'conflict') {
       assert.ok(['ok', 'no-changes'].includes(conflicted.status));
+      return;
     }
+
+    const resolved = await b.resolveConflicts('remote');
+    assert.strictEqual(resolved.status, 'ok');
+    assert.ok(!resolved.messages.some((m) => m.includes('could not be pushed')));
+
+    // Resolving must not just fix the mirror: it has to land on the local
+    // OpenCode file too (home asked to keep "remote", i.e. work's content)...
+    assert.strictEqual(fs.readFileSync(path.join(home.configRoot, 'AGENTS.md'), 'utf8'), '# from work\n');
+
+    // ...and the resolution commit must actually reach the remote, or the
+    // next machine to sync hits the exact same conflict all over again.
+    const status = await a.status();
+    assert.strictEqual(status.behind, 0);
+  });
+
+  it('first-ever pull adopts the remote unconditionally, matching /sync-link', async () => {
+    // Pin the remote to a known value directly, rather than relying on
+    // whatever the earlier conflict test happened to leave behind.
+    fs.writeFileSync(path.join(work.configRoot, 'AGENTS.md'), '# known remote content\n', 'utf8');
+    await managerFor(work).push();
+
+    const fresh = createMachine(root, 'fresh-link');
+    // A pre-existing local file that predates ever linking to the sync repo —
+    // /sync-link is documented to overwrite local config with synced content.
+    fs.mkdirSync(fresh.configRoot, { recursive: true });
+    fs.writeFileSync(path.join(fresh.configRoot, 'AGENTS.md'), '# stale local content\n', 'utf8');
+
+    await managerFor(fresh).pull();
+
+    assert.strictEqual(fs.readFileSync(path.join(fresh.configRoot, 'AGENTS.md'), 'utf8'), '# known remote content\n');
+  });
+
+  it('a real local edit made after a completed pull survives the next pull', async () => {
+    const laptop = createMachine(root, 'laptop');
+    await managerFor(laptop).pull(); // establishes this machine's "last pull" marker
+
+    fs.writeFileSync(path.join(laptop.configRoot, 'AGENTS.md'), '# edited on laptop after pulling\n', 'utf8');
+
+    await managerFor(laptop).pull();
+    assert.strictEqual(
+      fs.readFileSync(path.join(laptop.configRoot, 'AGENTS.md'), 'utf8'),
+      '# edited on laptop after pulling\n'
+    );
   });
 
   it('exposes ahead/behind status', async () => {

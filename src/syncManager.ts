@@ -167,7 +167,14 @@ export class SyncManager {
     return { status: applied.count > 0 ? 'ok' : 'no-changes', messages, changedFiles: applied.count };
   }
 
-  /** Resolves a conflicted merge by taking one side wholesale. */
+  /**
+   * Resolves a conflicted merge by taking one side wholesale, then finishes
+   * the sync that conflict interrupted: applies the resolution to the local
+   * OpenCode directories (so a pull-side conflict doesn't leave local files
+   * stuck on the pre-conflict state) and pushes the resolution commit (so a
+   * push-side conflict doesn't leave it stranded, unpushed, for the next
+   * sync to collide with all over again).
+   */
   async resolveConflicts(keep: 'local' | 'remote'): Promise<SyncOutcome> {
     await this.ensureRepo();
     const conflicted = (await this.git(['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })).stdout
@@ -188,11 +195,20 @@ export class SyncManager {
     }
     await this.git(['commit', '--no-edit'], { allowFailure: true });
 
-    return {
-      status: 'ok',
-      messages: [`Resolved ${conflicted.length} conflicted file(s), keeping the ${keep} version.`],
-      changedFiles: conflicted.length,
-    };
+    const messages = [`Resolved ${conflicted.length} conflicted file(s), keeping the ${keep} version.`];
+
+    const { items } = this.effectivePlan();
+    const applied = await this.applyFromRepo(items);
+    messages.push(...applied.messages);
+
+    const pushResult = await this.git(['push', '-u', 'origin', this.settings.branch], { allowFailure: true });
+    if (pushResult.code !== 0) {
+      messages.push(
+        `Resolution committed locally but could not be pushed (${(pushResult.stderr || pushResult.stdout).trim()}). Sync again once that's resolved.`
+      );
+    }
+
+    return { status: 'ok', messages, changedFiles: conflicted.length };
   }
 
   async status(): Promise<SyncRepoStatus> {
@@ -248,14 +264,28 @@ export class SyncManager {
   private async applyFromRepo(items: SyncItem[]): Promise<{ count: number; messages: string[] }> {
     const messages: string[] = [];
     let count = 0;
+    // `git checkout`/`merge` stamps every file in the mirror with "now", so
+    // comparing against the mirror's own mtime would almost never protect a
+    // real local edit (it's nearly always older than "the instant we just
+    // fetched"). Comparing against when THIS machine last completed a pull
+    // instead is the actual "has this been touched since I last synced?"
+    // check the local-edit protection needs.
+    const lastPullAt = await this.readLastPullAt();
 
     for (const item of items) {
       const source = path.join(this.repoDir, ...item.repoPath.split('/'));
       if (!(await exists(source))) {
         continue;
       }
-      count += item.type === 'file' ? ((await this.applyFile(source, item.localPath)) ? 1 : 0) : await this.applyTree(source, item.localPath);
+      count +=
+        item.type === 'file'
+          ? (await this.applyFile(source, item.localPath, lastPullAt))
+            ? 1
+            : 0
+          : await this.applyTree(source, item.localPath, lastPullAt);
     }
+
+    await this.writeLastPullAt(Date.now());
 
     if (count > 0) {
       messages.push('Restart OpenCode so it reloads the pulled state.');
@@ -264,20 +294,25 @@ export class SyncManager {
   }
 
   /**
-   * Never overwrite a local file that is newer than the synced copy. That is
-   * what keeps the machine you are actively working on from being rolled back
-   * by a stale push from the other one.
+   * Never overwrite a local file that was edited since our last successful
+   * pull — that is what keeps the machine you are actively working on from
+   * being rolled back by a stale sync from the other one. `lastPullAt === 0`
+   * means this machine has never pulled before (e.g. `/sync-link` onto a
+   * fresh machine), where adopting the remote's content unconditionally is
+   * the whole point, so the guard is skipped only in that case.
    */
-  private async applyFile(source: string, destination: string): Promise<boolean> {
+  private async applyFile(source: string, destination: string, lastPullAt: number): Promise<boolean> {
     try {
-      const sourceStat = await fs.stat(source);
       const destStat = await statOrNull(destination);
       if (destStat) {
-        if (destStat.mtimeMs > sourceStat.mtimeMs) {
+        const [sourceBuf, destBuf] = await Promise.all([fs.readFile(source), fs.readFile(destination)]);
+        if (sourceBuf.equals(destBuf)) {
           return false;
         }
-        const [a, b] = await Promise.all([fs.readFile(source), fs.readFile(destination)]);
-        if (a.equals(b)) {
+        // >= rather than >: filesystem mtimes and Date.now() can both land on
+        // the same millisecond when an edit follows a pull almost instantly,
+        // and a tie should fail safe (protect the local edit), not clobber it.
+        if (lastPullAt > 0 && destStat.mtimeMs >= lastPullAt) {
           return false;
         }
       }
@@ -289,18 +324,41 @@ export class SyncManager {
     }
   }
 
-  private async applyTree(sourceDir: string, destinationDir: string): Promise<number> {
+  private async applyTree(sourceDir: string, destinationDir: string, lastPullAt: number): Promise<number> {
     let count = 0;
     for (const entry of await readDirEntries(sourceDir)) {
       const source = path.join(sourceDir, entry.name);
       const destination = path.join(destinationDir, entry.name);
       if (entry.isDirectory()) {
-        count += await this.applyTree(source, destination);
-      } else if (await this.applyFile(source, destination)) {
+        count += await this.applyTree(source, destination, lastPullAt);
+      } else if (await this.applyFile(source, destination, lastPullAt)) {
         count += 1;
       }
     }
     return count;
+  }
+
+  /** Local-only bookkeeping under `.git/`, so it's never staged, committed, or synced. */
+  private stateFilePath(): string {
+    return path.join(this.repoDir, '.git', 'opencode-session-hub-state.json');
+  }
+
+  private async readLastPullAt(): Promise<number> {
+    try {
+      const parsed = JSON.parse(await fs.readFile(this.stateFilePath(), 'utf8'));
+      return typeof parsed.lastPullAt === 'number' ? parsed.lastPullAt : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async writeLastPullAt(at: number): Promise<void> {
+    try {
+      await fs.writeFile(this.stateFilePath(), JSON.stringify({ lastPullAt: at }), 'utf8');
+    } catch {
+      // Best-effort bookkeeping; losing it just means the next pull falls
+      // back to unconditional apply, not a sync failure.
+    }
   }
 
   private async copyFile(source: string, destination: string, isSecret: boolean): Promise<void> {
