@@ -43,7 +43,9 @@ Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
   "OpenCode Session Hub" view: connection (remote URL + branch), schedule
   (debounce, auto-pull/auto-push toggles), the security fail-closed gate,
   live sync health (status, ahead/behind, last sync, last error), and the
-  most recent sessions with one-click Preview/Resume — everything below,
+  most recent sessions with one-click Preview/Resume, and freely-curated
+  **favorite sessions** (a comment + a session id you add by hand — handy for
+  a session that scrolled out of the "most recent" list) — everything below,
   without leaving the sidebar. Open it via the Activity Bar icon or
   **OpenCode: Open Session Hub Panel**.
 - **Global session browser** (`OpenCode: List All Sessions`) — every session
@@ -81,9 +83,10 @@ Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
 
 Mirrors the upstream plugin's item set, so a repo stays compatible both ways:
 
-- `~/.config/opencode/`: `opencode.json`, `opencode.jsonc`, `AGENTS.md`, and
-  the `agent(s)`, `command(s)`, `mode(s)`, `tool(s)`, `themes`, `plugin(s)`,
-  `skills` directories
+- `~/.config/opencode/`: `opencode.json`, `opencode.jsonc`, `AGENTS.md`,
+  `opencode-session-hub-favorites.json` (the sidebar's favorite sessions
+  list), and the `agent(s)`, `command(s)`, `mode(s)`, `tool(s)`, `themes`,
+  `plugin(s)`, `skills` directories
 - `~/.agents/`
 - `~/.local/state/opencode/model.json` (model favorites)
 - Session artifacts, **only when secrets are enabled and acknowledged**:
@@ -185,9 +188,9 @@ if you need them:
 ```bash
 npm install
 npm run compile
-npm test        # 57 tests: storage scanning, sanitizer, path mapping,
+npm test        # 71 tests: storage scanning, sanitizer, path mapping,
                 # two-machine sync simulation, extension activation,
-                # sidebar dashboard message protocol
+                # sidebar dashboard message protocol, favorite sessions
 ```
 
 Press `F5` in VS Code to launch an Extension Development Host.

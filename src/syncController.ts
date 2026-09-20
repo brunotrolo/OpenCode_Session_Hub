@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { addFavorite, FavoriteSession, loadFavorites, removeFavorite } from './favorites';
 import { OpenCodeLocations, resolveOpenCodeLocations } from './opencodePaths';
 import { DirectoryMapping } from './pathMapper';
 import { scanSessions, SessionRecord } from './sessionScanner';
@@ -74,6 +75,23 @@ export class SyncController {
 
   listSessions(): { sessions: SessionRecord[]; warnings: string[] } {
     return scanSessions(this.getLocations());
+  }
+
+  listFavorites(): FavoriteSession[] {
+    return loadFavorites(this.getLocations());
+  }
+
+  /**
+   * Favorites live in a config file the sync plan already mirrors, so
+   * adding one is picked up by the very next push/pull with no dedicated
+   * sync logic — the only thing this needs to do is write the file.
+   */
+  addFavorite(label: string, sessionId: string): FavoriteSession {
+    return addFavorite(this.getLocations(), label, sessionId);
+  }
+
+  removeFavorite(id: string): void {
+    removeFavorite(this.getLocations(), id);
   }
 
   async updateSetting(key: string, value: unknown): Promise<void> {

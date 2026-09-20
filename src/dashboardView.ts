@@ -28,7 +28,11 @@ type Inbound =
     }
   | { type: 'previewSession'; id: string }
   | { type: 'resumeSession'; id: string }
-  | { type: 'openFullList' };
+  | { type: 'openFullList' }
+  | { type: 'saveFavorite'; label: string; sessionId: string }
+  | { type: 'removeFavorite'; id: string }
+  | { type: 'previewFavorite'; sessionId: string }
+  | { type: 'resumeFavorite'; sessionId: string };
 
 /**
  * Sidebar control panel: the sync remote, schedule, security gate, live
@@ -110,46 +114,34 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           this.postState();
           return;
 
-        case 'previewSession': {
-          const record = this.findSession(message.id);
-          if (record) {
-            showSessionPreview(this.controller.getLocations(), record);
-          }
+        case 'previewSession':
+          this.previewById(message.id);
           return;
-        }
 
-        case 'resumeSession': {
-          const record = this.findSession(message.id);
-          if (!record) {
-            return;
-          }
-
-          // Mirrors the cross-OS resolution the full "List All Sessions"
-          // flow does — without it, a session recorded on the other machine
-          // resumes with a cwd that doesn't exist here.
-          const directory = resolveLocalDirectory(record.directory, {
-            mappings: this.controller.getMappings(),
-            workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
-            searchRoots: vscode.workspace
-              .getConfiguration('opencodeSessionHub')
-              .get<string[]>('projectSearchRoots', []),
-          });
-
-          if (!directory) {
-            vscode.window.showWarningMessage(
-              `"${record.directory || 'unknown'}" does not exist on this machine — use "OpenCode: List All Sessions" to pick a folder for it.`
-            );
-            return;
-          }
-
-          const terminal = vscode.window.createTerminal({ name: `OpenCode: ${record.title}`, cwd: directory });
-          terminal.show();
-          terminal.sendText(`opencode --session ${record.id}`);
+        case 'resumeSession':
+          this.resumeById(message.id);
           return;
-        }
 
         case 'openFullList':
           await vscode.commands.executeCommand('opencodeSessionHub.listAllSessions');
+          return;
+
+        case 'saveFavorite':
+          this.controller.addFavorite(message.label, message.sessionId);
+          this.postState();
+          return;
+
+        case 'removeFavorite':
+          this.controller.removeFavorite(message.id);
+          this.postState();
+          return;
+
+        case 'previewFavorite':
+          this.previewById(message.sessionId);
+          return;
+
+        case 'resumeFavorite':
+          this.resumeById(message.sessionId);
           return;
       }
     } catch (err) {
@@ -161,6 +153,50 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
   private findSession(id: string): SessionRecord | undefined {
     return this.controller.listSessions().sessions.find((s) => s.id === id);
+  }
+
+  private previewById(sessionId: string): void {
+    const record = this.findSession(sessionId);
+    if (!record) {
+      vscode.window.showWarningMessage(
+        `No session with id "${sessionId}" found on this machine yet — try "Pull Now" first.`
+      );
+      return;
+    }
+    showSessionPreview(this.controller.getLocations(), record);
+  }
+
+  /**
+   * A favorite only remembers a session id and a label — it has no directory
+   * of its own. Resuming still needs the same cross-OS resolution the full
+   * "List All Sessions" flow does, applied to whatever session currently
+   * carries that id on this machine.
+   */
+  private resumeById(sessionId: string): void {
+    const record = this.findSession(sessionId);
+    if (!record) {
+      vscode.window.showWarningMessage(
+        `No session with id "${sessionId}" found on this machine yet — try "Pull Now" first.`
+      );
+      return;
+    }
+
+    const directory = resolveLocalDirectory(record.directory, {
+      mappings: this.controller.getMappings(),
+      workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+      searchRoots: vscode.workspace.getConfiguration('opencodeSessionHub').get<string[]>('projectSearchRoots', []),
+    });
+
+    if (!directory) {
+      vscode.window.showWarningMessage(
+        `"${record.directory || 'unknown'}" does not exist on this machine — use "OpenCode: List All Sessions" to pick a folder for it.`
+      );
+      return;
+    }
+
+    const terminal = vscode.window.createTerminal({ name: `OpenCode: ${record.title}`, cwd: directory });
+    terminal.show();
+    terminal.sendText(`opencode --session ${record.id}`);
   }
 
   private postState(): void {
@@ -187,6 +223,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         messageCount: s.messageCount,
       })),
       sessionCount: sessions.length,
+      favorites: this.controller.listFavorites(),
       warnings,
     });
   }
@@ -290,6 +327,17 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   <div id="sessions"></div>
   <div class="row"><button id="btn-open-list" class="secondary">Browse All Sessions…</button></div>
 
+  <h2>Favorite Sessions</h2>
+  <div id="favorites"></div>
+  <label for="favLabel">Comentario</label>
+  <input id="favLabel" type="text" placeholder="Sessao de Desenvolvimento de HTML Hello World" />
+  <label for="favSessionId">Session Id</label>
+  <input id="favSessionId" type="text" placeholder="ses_f4a55ea3effeDnzTiAaKbI0X92" />
+  <div class="row">
+    <button id="btn-save-favorite">Salvar</button>
+    <button id="btn-new-favorite" class="secondary">Incluir novo item</button>
+  </div>
+
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
@@ -301,7 +349,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   }
 
   function render(msg) {
-    const { state, settings, schedule, sessions, sessionCount, warnings } = msg;
+    const { state, settings, schedule, sessions, sessionCount, favorites, warnings } = msg;
 
     $('health').innerHTML =
       '<span class="badge badge-' + state.status + '">' + badgeLabel[state.status] + '</span>' +
@@ -340,11 +388,34 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           '</div></li>').join('') + '</ul>'
       : '<p class="empty">No sessions found yet.</p>';
 
-    document.querySelectorAll('[data-action]').forEach((btn) => {
+    document.querySelectorAll('[data-action="preview"], [data-action="resume"]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const action = btn.getAttribute('data-action');
         const id = btn.getAttribute('data-id');
         vscode.postMessage({ type: action === 'preview' ? 'previewSession' : 'resumeSession', id });
+      });
+    });
+
+    $('favorites').innerHTML = (favorites || []).length
+      ? '<ul class="sessions">' + favorites.map((f) =>
+          '<li><div class="title">' + escapeHtml(f.label) + '</div>' +
+          '<div class="meta">' + escapeHtml(f.sessionId) + '</div>' +
+          '<div class="row">' +
+          '<button class="secondary" data-fav-action="preview" data-session-id="' + escapeHtml(f.sessionId) + '">Preview</button>' +
+          '<button class="secondary" data-fav-action="resume" data-session-id="' + escapeHtml(f.sessionId) + '">Resume</button>' +
+          '<button class="secondary" data-fav-action="remove" data-id="' + escapeHtml(f.id) + '">Remover</button>' +
+          '</div></li>').join('') + '</ul>'
+      : '<p class="empty">Nenhuma sessao favoritada ainda.</p>';
+
+    document.querySelectorAll('[data-fav-action]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const action = btn.getAttribute('data-fav-action');
+        if (action === 'remove') {
+          vscode.postMessage({ type: 'removeFavorite', id: btn.getAttribute('data-id') });
+          return;
+        }
+        const sessionId = btn.getAttribute('data-session-id');
+        vscode.postMessage({ type: action === 'preview' ? 'previewFavorite' : 'resumeFavorite', sessionId });
       });
     });
   }
@@ -379,6 +450,21 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       includeSessions: $('includeSessions').checked,
       redactSecrets: $('redactSecrets').checked,
     });
+  });
+
+  $('btn-save-favorite').addEventListener('click', () => {
+    const sessionId = $('favSessionId').value.trim();
+    if (!sessionId) {
+      return;
+    }
+    vscode.postMessage({ type: 'saveFavorite', label: $('favLabel').value, sessionId });
+    $('favLabel').value = '';
+    $('favSessionId').value = '';
+  });
+  $('btn-new-favorite').addEventListener('click', () => {
+    $('favLabel').value = '';
+    $('favSessionId').value = '';
+    $('favLabel').focus();
   });
 
   vscode.postMessage({ type: 'ready' });
