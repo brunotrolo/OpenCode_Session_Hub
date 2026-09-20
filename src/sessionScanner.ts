@@ -75,6 +75,28 @@ export function loadMessages(locations: OpenCodeLocations, record: SessionRecord
   }
 }
 
+/**
+ * Permanently removes a session's own files from this machine's OpenCode
+ * storage. This only ever touches the local copy — sync repo history and
+ * any other machine's copy are untouched, since deleting a session locally
+ * is not itself something the sync plan is asked to propagate (session
+ * directories merge rather than mirror precisely so an incomplete local
+ * state can't wipe another machine's history).
+ */
+export function deleteSession(locations: OpenCodeLocations, record: SessionRecord): void {
+  switch (record.source) {
+    case 'sqlite':
+      deleteSqliteSession(locations.databasePath, record.id);
+      return;
+    case 'storage-json':
+      deleteStorageSession(locations.storageRoot, record);
+      return;
+    case 'legacy-json':
+      deleteLegacySession(locations.dataRoot, record);
+      return;
+  }
+}
+
 // ---------------------------------------------------------------- SQLite ---
 
 interface SqliteHandle {
@@ -180,6 +202,40 @@ function loadSqliteMessages(databasePath: string, sessionId: string): SessionMes
     return [];
   } finally {
     handle.close();
+  }
+}
+
+/**
+ * Deletes a session's rows from opencode.db. This needs write access, so it
+ * cannot reuse `openDatabase()` (which is deliberately readOnly to never
+ * take a write lock on a database OpenCode has open). part/message rows are
+ * deleted explicitly rather than relying on ON DELETE CASCADE, since
+ * cascading only applies when the connection has PRAGMA foreign_keys turned
+ * on, which is not the default for a bare connection.
+ */
+function deleteSqliteSession(databasePath: string, sessionId: string): void {
+  if (!fs.existsSync(databasePath)) {
+    return;
+  }
+
+  let DatabaseSync: new (p: string, o?: Record<string, unknown>) => {
+    prepare(sql: string): { run(...params: unknown[]): void };
+    close(): void;
+  };
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return;
+  }
+
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare('DELETE FROM part WHERE session_id = ?').run(sessionId);
+    db.prepare('DELETE FROM message WHERE session_id = ?').run(sessionId);
+    db.prepare('DELETE FROM session WHERE id = ?').run(sessionId);
+  } finally {
+    db.close();
   }
 }
 
@@ -290,6 +346,17 @@ function readPartTexts(partDir: string): string {
     .join('\n');
 }
 
+function deleteStorageSession(storageRoot: string, record: SessionRecord): void {
+  const messageDir = path.join(storageRoot, 'message', record.id);
+  for (const file of listDir(messageDir).filter((f) => f.endsWith('.json'))) {
+    const raw = readJson(path.join(messageDir, file));
+    const messageId = String(raw?.id ?? path.basename(file, '.json'));
+    removeDir(path.join(storageRoot, 'part', messageId));
+  }
+  removeDir(messageDir);
+  removeFile(path.join(storageRoot, 'session', record.projectId, `${record.id}.json`));
+}
+
 // --------------------------------------------------------- legacy layout ---
 
 function readLegacySessions(dataRoot: string): SessionRecord[] {
@@ -361,6 +428,17 @@ function loadLegacyMessages(dataRoot: string, sessionId: string): SessionMessage
   }
 
   return [];
+}
+
+function deleteLegacySession(dataRoot: string, record: SessionRecord): void {
+  const base = path.join(dataRoot, 'project', record.projectId, 'storage', 'session');
+  // Unlike storage-json (where parts live in a global storage/part/<messageId>/
+  // shared across all sessions), the legacy layout nests parts under
+  // storage/session/part/<sessionId>/<messageId>/ — exclusively owned by this
+  // session, so the whole subtree can go at once.
+  removeDir(path.join(base, 'part', record.id));
+  removeDir(path.join(base, 'message', record.id));
+  removeFile(path.join(base, 'info', `${record.id}.json`));
 }
 
 // ---------------------------------------------------------------- shared ---
@@ -464,4 +542,20 @@ function isDir(dir: string): boolean {
 
 function countDir(dir: string): number {
   return listDir(dir).filter((f) => f.endsWith('.json')).length;
+}
+
+function removeDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Best-effort: a missing or locked directory shouldn't block the rest of the delete.
+  }
+}
+
+function removeFile(filePath: string): void {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch {
+    // Best-effort, same as removeDir.
+  }
 }

@@ -74,3 +74,13 @@ export function removeFavorite(locations: OpenCodeLocations, id: string): void {
   const favorites = loadFavorites(locations).filter((favorite) => favorite.id !== id);
   saveFavorites(locations, favorites);
 }
+
+/** Drops every bookmark pointing at a session id — used when that session itself is deleted. */
+export function removeFavoritesBySessionId(locations: OpenCodeLocations, sessionId: string): number {
+  const before = loadFavorites(locations);
+  const after = before.filter((favorite) => favorite.sessionId !== sessionId);
+  if (after.length !== before.length) {
+    saveFavorites(locations, after);
+  }
+  return before.length - after.length;
+}

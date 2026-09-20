@@ -267,6 +267,28 @@ describe('sidebar dashboard', () => {
     assert.strictEqual(state.favorites.length, 0);
   });
 
+  it('deleting a session requires confirmation and removes it from the list', async () => {
+    stub.warningResponder = () => undefined; // dismiss/cancel
+    await onMessage({ type: 'refresh' });
+    const before = latestState().sessionCount;
+
+    await onMessage({ type: 'deleteSession', id: 'ses_dash1' });
+    assert.strictEqual(latestState().sessionCount, before, 'cancelling must not delete anything');
+
+    stub.warningResponder = () => 'Delete'; // confirm
+    await onMessage({ type: 'deleteSession', id: 'ses_dash1' });
+
+    const state = latestState();
+    assert.strictEqual(state.sessionCount, before - 1);
+    assert.ok(!state.sessions.some((s: { id: string }) => s.id === 'ses_dash1'));
+  });
+
+  it('warns instead of crashing when asked to delete an unknown session id', async () => {
+    stub.messages.length = 0;
+    await onMessage({ type: 'deleteSession', id: 'does-not-exist' });
+    assert.ok(stub.messages.some((m) => m.kind === 'warn'));
+  });
+
   it('surfaces a sync error to the state instead of throwing out of the handler', async () => {
     await onMessage({ type: 'saveConnection', remoteUrl: 'file:///definitely/not/a/repo', branch: 'main' });
     await onMessage({ type: 'push' });

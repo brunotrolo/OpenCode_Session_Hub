@@ -3,6 +3,8 @@ export interface StubState {
   config: Record<string, unknown>;
   quickPickResponder: (items: unknown[], options: unknown) => unknown;
   inputResponder: (options: unknown) => string | undefined;
+  /** Controls what a showWarningMessage(...) confirmation resolves to — e.g. return 'Delete' to confirm. */
+  warningResponder: (text: string, ...items: string[]) => string | undefined;
   terminals: { name: string; cwd?: string; sent: string[] }[];
   webviews: { title: string; html: string }[];
   messages: { kind: 'info' | 'warn' | 'error'; text: string }[];
@@ -17,6 +19,7 @@ export function installVscodeStub(): StubState {
     config: {},
     quickPickResponder: (items) => (items as unknown[])[0],
     inputResponder: () => undefined,
+    warningResponder: () => undefined,
     terminals: [],
     webviews: [],
     messages: [],
@@ -109,9 +112,10 @@ export function installVscodeStub(): StubState {
         state.messages.push({ kind: 'info', text });
         return undefined;
       },
-      showWarningMessage: async (text: string) => {
+      showWarningMessage: async (text: string, ...rest: unknown[]) => {
         state.messages.push({ kind: 'warn', text });
-        return undefined;
+        const items = rest.filter((item): item is string => typeof item === 'string');
+        return state.warningResponder(text, ...items);
       },
       showErrorMessage: async (text: string) => {
         state.messages.push({ kind: 'error', text });
