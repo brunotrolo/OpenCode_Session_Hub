@@ -1,63 +1,89 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as vscode from 'vscode';
+
+export interface DirectoryMapping {
+  from: string;
+  to: string;
+}
+
+export interface ResolveOptions {
+  /** Explicit user-configured prefix rewrites, applied first. */
+  mappings: DirectoryMapping[];
+  /** Folders currently open in the window. */
+  workspaceFolders: string[];
+  /** Folders to scan one level deep for a matching project name. */
+  searchRoots: string[];
+  exists?: (candidate: string) => boolean;
+}
 
 /**
- * A session's `directory` field was recorded on whatever machine created it
- * (e.g. C:\Projetos\meu-repo at home vs /home/user/meu-repo at work). This
- * resolves it against the folders actually open/known on THIS machine by
- * matching folder basenames and git remote URLs, so opening a session never
- * requires the original absolute path to exist.
+ * A session records the absolute directory of the machine that created it
+ * (`C:\Projetos\repo` at home vs `/home/user/repo` at work). Resuming it
+ * elsewhere needs that path translated to something that exists here.
  */
-export function resolveLocalDirectory(recordedDirectory: string): string | null {
-  if (fs.existsSync(recordedDirectory)) {
+export function resolveLocalDirectory(recordedDirectory: string, options: ResolveOptions): string | null {
+  const exists = options.exists ?? defaultExists;
+  if (!recordedDirectory) {
+    return null;
+  }
+
+  const mapped = applyMappings(recordedDirectory, options.mappings);
+  if (exists(mapped)) {
+    return mapped;
+  }
+  if (mapped !== recordedDirectory && exists(recordedDirectory)) {
     return recordedDirectory;
   }
 
-  const targetBasename = path.basename(recordedDirectory.replace(/[\\/]+$/, ''));
-  const candidates = collectCandidateFolders();
+  const targetName = basenameCrossPlatform(recordedDirectory);
+  if (!targetName) {
+    return null;
+  }
 
-  const exactNameMatch = candidates.find(
-    (dir) => path.basename(dir).toLowerCase() === targetBasename.toLowerCase()
-  );
-  if (exactNameMatch) {
-    return exactNameMatch;
+  for (const folder of options.workspaceFolders) {
+    if (path.basename(folder).toLowerCase() === targetName.toLowerCase() && exists(folder)) {
+      return folder;
+    }
+  }
+
+  for (const root of options.searchRoots) {
+    const candidate = path.join(root, targetName);
+    if (exists(candidate)) {
+      return candidate;
+    }
   }
 
   return null;
 }
 
-function collectCandidateFolders(): string[] {
-  const folders = new Set<string>();
-
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    folders.add(folder.uri.fsPath);
-  }
-
-  const recentSetting = vscode.workspace
-    .getConfiguration('opencodeSessionHub')
-    .get<string[]>('knownWorkspaceRoots', []);
-  for (const root of recentSetting) {
-    if (fs.existsSync(root)) {
-      for (const entry of safeReadDir(root)) {
-        folders.add(path.join(root, entry));
-      }
+export function applyMappings(inputPath: string, mappings: DirectoryMapping[]): string {
+  for (const mapping of mappings) {
+    if (!mapping.from) {
+      continue;
+    }
+    // Windows paths are case-insensitive, so compare folded but rebuild from
+    // the original so the untouched remainder keeps its real casing.
+    const normalizedInput = inputPath.replace(/\\/g, '/').toLowerCase();
+    const normalizedFrom = mapping.from.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+    if (normalizedInput === normalizedFrom || normalizedInput.startsWith(`${normalizedFrom}/`)) {
+      const remainder = inputPath.replace(/\\/g, '/').slice(normalizedFrom.length).replace(/^\/+/, '');
+      return remainder ? path.join(mapping.to, remainder) : mapping.to;
     }
   }
-
-  return [...folders];
+  return inputPath;
 }
 
-function safeReadDir(dir: string): string[] {
+/** `path.basename` on POSIX does not split a Windows path, and vice versa. */
+export function basenameCrossPlatform(inputPath: string): string {
+  const trimmed = inputPath.replace(/[\\/]+$/, '');
+  const segments = trimmed.split(/[\\/]/);
+  return segments[segments.length - 1] ?? '';
+}
+
+function defaultExists(candidate: string): boolean {
   try {
-    return fs.readdirSync(dir).filter((entry) => {
-      try {
-        return fs.statSync(path.join(dir, entry)).isDirectory();
-      } catch {
-        return false;
-      }
-    });
+    return fs.statSync(candidate).isDirectory();
   } catch {
-    return [];
+    return false;
   }
 }

@@ -1,95 +1,197 @@
 # OpenCode Session Hub
 
-A VS Code extension that turns [OpenCode](https://opencode.ai) session history
-into something closer to a "Google Drive for your AI sessions": browse every
-session on the machine regardless of which folder the terminal was opened in,
-preview conversations without spinning up a new agent run, and keep sessions
-synced in the background between a work PC and a home PC through a private
-Git repository.
+A VS Code extension that makes [OpenCode](https://opencode.ai) sessions behave
+like a "Google Drive for AI sessions": browse **every** session on the machine
+regardless of which folder the terminal was opened in, preview conversations
+without starting an agent run, and keep sessions and config synced in the
+background between a work PC and a home PC through a private Git repository.
 
-Built on the idea from [iHildy/opencode-synced](https://github.com/iHildy/opencode-synced),
-adapted to run as a VS Code extension instead of an OpenCode plugin, with an
-added global session browser.
+The sync model follows [iHildy/opencode-synced](https://github.com/iHildy/opencode-synced),
+reimplemented as a VS Code extension and extended with a machine-wide session
+browser.
 
 ## Why
 
 `opencode session list` only shows sessions for the project matching the
 current working directory, because OpenCode scopes the query by workspace.
-All sessions from every project actually live in the same global storage
-tree — this extension reads that tree directly.
+Every session on the machine actually lives in the same global storage, so
+this extension reads that storage directly.
+
+## Storage layouts supported
+
+OpenCode's on-disk format changed twice, and one machine can hold all three at
+once (migrations copy forward rather than delete). All three are read and
+de-duplicated, newest generation winning:
+
+| Generation | Location |
+| --- | --- |
+| SQLite | `~/.local/share/opencode/opencode.db` (`session` / `message` / `part` tables) |
+| Storage JSON | `~/.local/share/opencode/storage/session/<projectID>/<sessionID>.json`, `storage/message/<sessionID>/`, `storage/part/<messageID>/` |
+| Legacy JSON | `~/.local/share/opencode/project/<hash>/storage/session/info/<sessionID>.json` |
+
+Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
+**every** platform — including Windows, where OpenCode uses
+`%USERPROFILE%\.local\share\opencode`, not `%LOCALAPPDATA%`.
+
+> Reading `opencode.db` uses Node's built-in `node:sqlite`, which requires
+> Node 22.5+. On a VS Code build with older Node, the JSON layouts still list
+> normally and a warning explains that the database was skipped.
 
 ## Features
 
-- **Global session browser** (`OpenCode: List All Sessions`) — QuickPick
-  listing every session across every project on the machine, sorted by last
-  update, with the option to resume in a terminal, preview the conversation,
-  or open the originating folder in a new window.
-- **Cross-OS path resolution** — if a session was recorded on another machine
-  (e.g. `C:\Projetos\repo` at home vs `/home/user/repo` at work), the
-  extension matches it to a local folder by name instead of failing on a
-  path that doesn't exist here.
-- **Read-only conversation preview** — a webview panel rendering a session's
-  messages, so you can check status or copy a snippet without opening a
-  terminal.
-- **Background Git sync** — debounced push when the VS Code window loses
-  focus, automatic pull on startup, and manual `OpenCode Sync: Push/Pull Now`
-  commands. Mirrors session JSON into a separate sync repository rather than
-  syncing the live OpenCode storage directly, so a WAL/lock file is never
-  committed mid-write.
-- **Secret sanitizer** — before anything is committed to the sync repo, API
-  keys, bearer tokens, GitHub/Slack tokens, AWS keys, and DB connection
-  strings with embedded credentials are redacted.
-- **Handoff checkpoints** — `OpenCode: Generate Handoff Checkpoint` writes a
-  human-readable Markdown summary of a session to `.opencode/HANDOFF.md` as a
-  fallback if JSON sync ever fails.
-- **Full-text search** (`OpenCode: Search All Session History`) — search
-  every message across every session for a keyword.
-- **Status bar indicator** — shows sync state (synced / syncing / error /
-  unconfigured) and lets you trigger a push with one click.
+- **Sidebar control panel** — a dedicated Activity Bar icon opens the
+  "OpenCode Session Hub" view: connection (remote URL + branch), schedule
+  (debounce, auto-pull/auto-push toggles), the security fail-closed gate,
+  live sync health (status, ahead/behind, last sync, last error), and the
+  most recent sessions with one-click Preview/Resume — everything below,
+  without leaving the sidebar. Open it via the Activity Bar icon or
+  **OpenCode: Open Session Hub Panel**.
+- **Global session browser** (`OpenCode: List All Sessions`) — every session
+  across every project, newest first. Resume in a terminal, preview, open the
+  folder, or write a handoff.
+- **Cross-OS path resolution** — configured prefix rewrites
+  (`C:\Projetos` ⇄ `/home/user/projects`), then open-workspace name matching,
+  then configured search roots. If nothing resolves, you're offered a preview
+  or a folder picker instead of a broken `cd`.
+- **Read-only conversation preview** — a webview with a strict
+  `default-src 'none'` CSP. Message text is read from OpenCode's *part* files,
+  where it actually lives.
+- **Background Git sync** — pull on startup, debounced push when the window
+  loses focus, plus explicit init / link / push / pull / status / resolve
+  commands. A pull **applies** the repo to the local OpenCode directories, so
+  the other machine's sessions really show up.
+- **Fail-closed secrets** — session history counts as secret data and does not
+  leave the machine until you enable `includeSecrets` **and** confirm the
+  remote is private via `privateRepoAcknowledged`. The reason is always
+  surfaced, never silent.
+- **Secret sanitizer** — API keys, GitHub/Slack tokens, AWS keys, JWTs,
+  private keys and credential-bearing connection strings are redacted from
+  session payloads before commit. Config files are never rewritten (a redacted
+  `opencode.json` would be pushed and then applied on the other machine).
+- **Conflict resolution** — a real conflict is reported, not silently
+  discarded. `OpenCode Sync: Resolve Conflicts` takes one side wholesale,
+  then finishes the interrupted sync: applies the resolution to the local
+  OpenCode directories and pushes it, so the conflict doesn't reappear on
+  the next sync.
+- **Handoff checkpoints** — a Markdown summary at `.opencode/HANDOFF.md`.
+- **Full-text search** across every session's messages.
+- **Status bar indicator** — synced / syncing / conflict / error / unconfigured.
+
+## What gets synced
+
+Mirrors the upstream plugin's item set, so a repo stays compatible both ways:
+
+- `~/.config/opencode/`: `opencode.json`, `opencode.jsonc`, `AGENTS.md`, and
+  the `agent(s)`, `command(s)`, `mode(s)`, `tool(s)`, `themes`, `plugin(s)`,
+  `skills` directories
+- `~/.agents/`
+- `~/.local/state/opencode/model.json` (model favorites)
+- Session artifacts, **only when secrets are enabled and acknowledged**:
+  `opencode.db` plus `storage/session`, `storage/message`, `storage/part`,
+  `storage/session_diff`, `storage/project`
+
+Safety rules that apply on every sync:
+
+- `-wal`, `-shm`, `.lock` and `.tmp` files are never committed, and a database
+  with uncheckpointed WAL writes is skipped with a warning instead of being
+  copied mid-write.
+- Session directories **merge** rather than mirror — files missing locally are
+  never deleted from the repo, so one machine can't wipe the other's history.
+- A local file edited since this machine's last successful pull is never
+  overwritten by a later pull — protected against a stale sync clobbering
+  work in progress. The very first pull to a new machine (`/sync-link`) is
+  the deliberate exception: it adopts the remote unconditionally.
+
+## Installing
+
+This extension is not on the Marketplace — install the `.vsix` file directly:
+
+1. Download `opencode-session-hub-<version>.vsix` from the
+   [Releases page](https://github.com/brunotrolo/OpenCode_Session_Hub/releases)
+   (attached automatically to every published release — see below).
+2. In VS Code: Extensions view → `···` menu → **Install from VSIX...** → pick
+   the downloaded file. Or from the terminal:
+   ```bash
+   code --install-extension opencode-session-hub-<version>.vsix
+   ```
+
+### Building the .vsix yourself
+
+```bash
+npm install
+npm run package   # runs vsce package, writes opencode-session-hub-<version>.vsix
+```
+
+### Publishing a release with the .vsix attached
+
+The `.github/workflows/release.yml` workflow builds and attaches the `.vsix`
+automatically whenever a GitHub Release is published:
+
+1. Bump `version` in `package.json`.
+2. Push a tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) and create a
+   GitHub Release from it (or use `gh release create v0.2.0`).
+3. CI runs the tests, packages the `.vsix`, and uploads it as a release asset.
+
+This does **not** publish to the VS Code Marketplace — it only produces an
+installable file attached to the release.
 
 ## Setup
 
-1. Create a **private** Git repository to act as the sync destination (do
-   this once, from either machine).
-2. In VS Code settings, set:
-   - `opencodeSessionHub.syncRemoteUrl` — the private repo's URL.
-   - `opencodeSessionHub.storagePath` — only needed if OpenCode's storage
-     isn't at the default location for your OS.
-3. Run **OpenCode Sync: Initialize Sync Repository** once.
-4. On the second machine, set the same `syncRemoteUrl` and run
-   **OpenCode Sync: Pull Now**.
+1. Create a **private** Git repository for syncing.
+2. Run **OpenCode Sync: Initialize Sync Repository** (first machine) or
+   **OpenCode Sync: Link This Machine to an Existing Repository** (second
+   machine) and paste the URL.
+3. To include session history, set both `opencodeSessionHub.includeSecrets`
+   and `opencodeSessionHub.privateRepoAcknowledged` to `true` — only after
+   verifying the remote really is private.
 
-From then on, sync happens automatically: pull on startup, debounced push
-when the window loses focus (default 20s of inactivity).
+After that: pull on startup, debounced push when the window loses focus.
+Restart OpenCode after a pull so it reloads the new state.
 
 ## Settings
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `opencodeSessionHub.storagePath` | auto-detected | Override OpenCode's global storage directory |
-| `opencodeSessionHub.syncRepoPath` | extension global storage | Local mirror folder for the sync repo |
-| `opencodeSessionHub.syncRemoteUrl` | _(empty)_ | Git URL of the private sync repository |
-| `opencodeSessionHub.autoSyncOnFocusLost` | `true` | Debounced push when the window loses focus |
-| `opencodeSessionHub.autoPullOnStartup` | `true` | Pull latest state on VS Code startup |
-| `opencodeSessionHub.debounceSeconds` | `20` | Inactivity window before auto-push |
-| `opencodeSessionHub.redactSecrets` | `true` | Strip credential-shaped strings before syncing |
+| `dataPath` | auto | Override the OpenCode data directory |
+| `syncRemoteUrl` | _(empty)_ | Git URL of the private sync repository |
+| `syncBranch` | `main` | Branch used in the sync repository |
+| `syncRepoPath` | extension storage | Local mirror of the sync repo |
+| `includeSecrets` | `false` | Allow secret-class data (incl. sessions) to sync |
+| `privateRepoAcknowledged` | `false` | Confirms the remote is private |
+| `includeSessions` | `true` | Sync session history (still gated by the two above) |
+| `includeModelFavorites` | `true` | Sync `state/model.json` |
+| `includeOpencodeSkills` | `true` | Sync `~/.config/opencode/skills` |
+| `includeAgentsDir` | `true` | Sync `~/.agents` |
+| `directoryMappings` | `[]` | Cross-machine path rewrites |
+| `projectSearchRoots` | `[]` | Folders searched for a matching project name |
+| `autoPullOnStartup` | `true` | Pull when VS Code starts |
+| `autoSyncOnFocusLost` | `true` | Debounced push when the window blurs |
+| `debounceSeconds` | `20` | Inactivity window before auto-push |
+| `redactSecrets` | `true` | Redact credentials from session payloads |
+
+## Not implemented (upstream has these)
+
+Deliberately out of scope for this extension; use the `opencode-synced` plugin
+if you need them:
+
+- Turso session backend (concurrent-safe snapshot sync)
+- Chunking of files above 50 MiB into pointer + parts
+- `gh`-driven automatic private repo creation and visibility verification
+- Encrypted secrets backends and `auth.json` / `mcp-auth.json` syncing
+- Per-machine `opencode-synced.overrides.jsonc`
 
 ## Development
 
 ```bash
 npm install
 npm run compile
+npm test        # 57 tests: storage scanning, sanitizer, path mapping,
+                # two-machine sync simulation, extension activation,
+                # sidebar dashboard message protocol
 ```
 
-Then press `F5` in VS Code to launch an Extension Development Host.
+Press `F5` in VS Code to launch an Extension Development Host.
 
-## Safety notes
-
-- The extension never writes back into OpenCode's live storage — sync only
-  copies OUT of it into the separate sync repo, and pulls only ever land in
-  that same sync repo.
-- WAL/SHM/lock files are always skipped during sync to avoid touching a
-  SQLite database mid-write.
-- Treat the sync repository as sensitive even with redaction enabled —
-  redaction covers known credential shapes, not arbitrary secrets that might
-  appear in conversation text.
+The test suite builds fake OpenCode installs covering all three storage
+layouts and runs a real two-machine sync against a local bare repository, so
+the sync behavior is verified rather than assumed.

@@ -1,0 +1,35 @@
+name: Release
+
+# Builds the .vsix and attaches it to the GitHub Release whenever a release is
+# published (works for a tag pushed as a release, or "Publish release" in the
+# UI). Nothing here publishes to the VS Code Marketplace.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run tests
+        run: npm run compile && node --test "out/test/*.test.js"
+
+      - name: Package .vsix
+        run: npx vsce package --no-dependencies --out opencode-session-hub-${{ github.event.release.tag_name }}.vsix
+
+      - name: Attach .vsix to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: opencode-session-hub-*.vsix

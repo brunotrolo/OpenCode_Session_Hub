@@ -4,6 +4,11 @@
   "description": "Browse every OpenCode session on your machine and keep them synced across workstations via a private Git repository.",
   "version": "0.1.0",
   "publisher": "opencode-session-hub",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brunotrolo/OpenCode_Session_Hub.git"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -15,7 +20,29 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeSessionHub",
+          "title": "OpenCode Session Hub",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeSessionHub": [
+        {
+          "id": "opencodeSessionHub.dashboard",
+          "name": "Session Hub",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "opencodeSessionHub.openDashboard",
+        "title": "OpenCode: Open Session Hub Panel"
+      },
       {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"
@@ -37,6 +64,18 @@
         "title": "OpenCode Sync: Initialize Sync Repository"
       },
       {
+        "command": "opencodeSessionHub.syncLink",
+        "title": "OpenCode Sync: Link This Machine to an Existing Repository"
+      },
+      {
+        "command": "opencodeSessionHub.syncStatus",
+        "title": "OpenCode Sync: Show Status"
+      },
+      {
+        "command": "opencodeSessionHub.syncResolve",
+        "title": "OpenCode Sync: Resolve Conflicts"
+      },
+      {
         "command": "opencodeSessionHub.generateHandoff",
         "title": "OpenCode: Generate Handoff Checkpoint"
       },
@@ -48,10 +87,10 @@
     "configuration": {
       "title": "OpenCode Session Hub",
       "properties": {
-        "opencodeSessionHub.storagePath": {
+        "opencodeSessionHub.dataPath": {
           "type": "string",
           "default": "",
-          "description": "Override the OpenCode global storage directory. Leave empty to auto-detect (~/.local/share/opencode on Linux/macOS, %LOCALAPPDATA%\\opencode on Windows)."
+          "description": "Override the OpenCode data directory. Leave empty to auto-detect ($XDG_DATA_HOME/opencode, i.e. ~/.local/share/opencode on every platform including Windows)."
         },
         "opencodeSessionHub.syncRepoPath": {
           "type": "string",
@@ -61,7 +100,70 @@
         "opencodeSessionHub.syncRemoteUrl": {
           "type": "string",
           "default": "",
-          "description": "Git remote URL of the private sync repository (e.g. git@github.com:you/my-opencode-sync.git)."
+          "description": "Git remote URL of the private sync repository (e.g. git@github.com:you/my-opencode-config.git)."
+        },
+        "opencodeSessionHub.syncBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "Branch used in the sync repository."
+        },
+        "opencodeSessionHub.includeSecrets": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow secret-class data (including session history) to be synced. Requires opencodeSessionHub.privateRepoAcknowledged."
+        },
+        "opencodeSessionHub.privateRepoAcknowledged": {
+          "type": "boolean",
+          "default": false,
+          "description": "Confirm you have verified the sync remote is PRIVATE. Session history and secrets stay local until this is true."
+        },
+        "opencodeSessionHub.includeSessions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync OpenCode session history (opencode.db and storage/session|message|part). Also requires includeSecrets + privateRepoAcknowledged."
+        },
+        "opencodeSessionHub.includeModelFavorites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync model favorites (state/model.json)."
+        },
+        "opencodeSessionHub.includeOpencodeSkills": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync the OpenCode skills directory (~/.config/opencode/skills)."
+        },
+        "opencodeSessionHub.includeAgentsDir": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync the home agents directory (~/.agents)."
+        },
+        "opencodeSessionHub.directoryMappings": {
+          "type": "array",
+          "default": [],
+          "description": "Cross-machine path rewrites applied when resuming a session, e.g. [{\"from\": \"C:\\\\Projetos\", \"to\": \"/home/user/projects\"}].",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        },
+        "opencodeSessionHub.projectSearchRoots": {
+          "type": "array",
+          "default": [],
+          "description": "Folders searched one level deep for a project matching a session's recorded directory name.",
+          "items": {
+            "type": "string"
+          }
         },
         "opencodeSessionHub.autoSyncOnFocusLost": {
           "type": "boolean",
@@ -81,7 +183,7 @@
         "opencodeSessionHub.redactSecrets": {
           "type": "boolean",
           "default": true,
-          "description": "Strip API keys, tokens and other credential-shaped strings from session data before syncing."
+          "description": "Strip API keys, tokens and other credential-shaped strings from session data before syncing. Config files are never rewritten."
         }
       }
     }
@@ -89,11 +191,14 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test \"out/test/*.test.js\"",
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.10.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0",
     "typescript": "^5.4.0"
   }
 }
