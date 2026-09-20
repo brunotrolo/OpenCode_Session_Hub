@@ -1,51 +1,47 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as vscode from 'vscode';
-import { loadSessionMessages, SessionRecord } from './sessionScanner';
+import { OpenCodeLocations } from './opencodePaths';
 import { sanitizeString } from './secretSanitizer';
+import { loadMessages, SessionMessage, SessionRecord } from './sessionScanner';
 
-/**
- * Writes a lightweight, human-readable Markdown snapshot of a session into
- * `.opencode/HANDOFF.md` in the workspace. Acts as a fallback record if the
- * JSON sync ever fails between machines.
- */
-export async function generateHandoff(record: SessionRecord, workspaceRoot: string): Promise<string> {
-  const messages = loadSessionMessages(record);
-  const dir = path.join(workspaceRoot, '.opencode');
-  fs.mkdirSync(dir, { recursive: true });
+const MAX_MESSAGES = 20;
 
+export function renderHandoff(record: SessionRecord, messages: SessionMessage[]): string {
   const lines: string[] = [
     `# OpenCode Handoff — ${record.title}`,
     '',
     `- Session ID: \`${record.id}\``,
-    `- Directory: \`${record.directory}\``,
-    `- Last updated: ${new Date(record.updatedAt).toLocaleString()}`,
+    `- Directory: \`${record.directory || 'unknown'}\``,
+    `- Last updated: ${record.updatedAt ? new Date(record.updatedAt).toISOString() : 'unknown'}`,
     `- Messages: ${record.messageCount}`,
     '',
-    '## Recent activity',
+    `## Last ${Math.min(MAX_MESSAGES, messages.length)} messages`,
     '',
   ];
 
-  const tail = messages.slice(-20);
-  for (const msg of tail) {
-    const role = String(msg.role ?? 'unknown');
-    const text = typeof msg.text === 'string' ? msg.text : typeof msg.content === 'string' ? msg.content : '';
-    if (!text) {
+  for (const msg of messages.slice(-MAX_MESSAGES)) {
+    if (!msg.text.trim()) {
       continue;
     }
-    lines.push(`### ${role}`, '', sanitizeString(text), '');
+    lines.push(`### ${msg.role}`, '', sanitizeString(msg.text).trim(), '');
   }
 
-  const filePath = path.join(dir, 'HANDOFF.md');
-  fs.writeFileSync(filePath, lines.join('\n'), 'utf8');
-  return filePath;
+  return lines.join('\n');
 }
 
-export async function generateHandoffForActiveWorkspace(record: SessionRecord): Promise<string | null> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
-    vscode.window.showWarningMessage('Open a workspace folder to generate a handoff checkpoint.');
-    return null;
-  }
-  return generateHandoff(record, folder.uri.fsPath);
+/**
+ * Writes a human-readable snapshot to `.opencode/HANDOFF.md`, a fallback
+ * record for when JSON/SQLite sync can't be trusted between machines.
+ */
+export function generateHandoff(
+  locations: OpenCodeLocations,
+  record: SessionRecord,
+  workspaceRoot: string
+): string {
+  const dir = path.join(workspaceRoot, '.opencode');
+  fs.mkdirSync(dir, { recursive: true });
+
+  const filePath = path.join(dir, 'HANDOFF.md');
+  fs.writeFileSync(filePath, renderHandoff(record, loadMessages(locations, record)), 'utf8');
+  return filePath;
 }
