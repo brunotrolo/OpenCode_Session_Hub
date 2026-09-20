@@ -200,6 +200,46 @@ describe('two-machine sync simulation', () => {
     assert.ok(fs.existsSync(path.join(walMachine.home, 'sync-repo', 'data', 'opencode.db')));
   });
 
+  it('a file copy failure degrades to a skip message instead of failing the whole sync', async () => {
+    // Real-world report: on Windows, fs.copyFile can throw a bare
+    // "UNKNOWN: unknown error, copyfile ..." for a transient sharing
+    // violation even after a successful checkpoint (SQLite or antivirus
+    // briefly holding a handle). That used to propagate all the way up and
+    // fail the entire push with nothing else committed. Reproduced here
+    // platform-independently: a directory where a plain file is expected
+    // makes fs.copyFile throw consistently on any OS.
+    // A dedicated remote, so this session doesn't leak into the shared
+    // `remote` and pollute later tests that assert on its exact contents.
+    const isolatedRemote = path.join(root, 'locked-file-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', isolatedRemote]);
+
+    const lockedMachine = createMachine(root, 'locked-file');
+    addStorageSession(lockedMachine, {
+      projectId: 'prj_locked',
+      sessionId: 'ses_locked',
+      title: 'Should still sync',
+      worktree: '/locked/project',
+    });
+    fs.mkdirSync(path.join(lockedMachine.configRoot, 'AGENTS.md')); // a directory, not a file
+
+    const outcome = await new SyncManager(
+      resolveOpenCodeLocations(lockedMachine.env, 'linux'),
+      settingsFor(lockedMachine, { remoteUrl: isolatedRemote })
+    ).push();
+
+    assert.strictEqual(outcome.status, 'ok');
+    assert.ok(
+      outcome.messages.some((m) => m.includes('AGENTS.md') && m.includes('Skipped')),
+      outcome.messages.join(' | ')
+    );
+    // The rest of the sync still went through despite that one failure.
+    assert.ok(
+      fs.existsSync(
+        path.join(lockedMachine.home, 'sync-repo', 'data', 'storage', 'session', 'prj_locked', 'ses_locked.json')
+      )
+    );
+  });
+
   it('merges sessions from both machines instead of deleting the other side', async () => {
     addStorageSession(home, {
       projectId: 'prj_home',
