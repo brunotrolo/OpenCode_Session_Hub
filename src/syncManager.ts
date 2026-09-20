@@ -286,13 +286,16 @@ export class SyncManager {
           );
           continue;
         }
-        await this.copyFile(item.localPath, destination, item.isSecret);
+        const failure = await this.copyFile(item.localPath, destination, item.isSecret);
+        if (failure) {
+          messages.push(failure);
+        }
         continue;
       }
 
       // Session directories merge instead of mirroring: pruning repo files that
       // are merely absent here would wipe the other machine's sessions.
-      await this.copyTree(item.localPath, destination, item.isSecret, !item.isSecret);
+      messages.push(...(await this.copyTree(item.localPath, destination, item.isSecret, !item.isSecret)));
     }
 
     return messages;
@@ -361,8 +364,26 @@ export class SyncManager {
         }
       }
       await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.copyFile(source, destination);
-      return true;
+      // Same transient-lock tolerance as the push-side copy: overwriting a
+      // live opencode.db while OpenCode still has it open can hit the same
+      // brief Windows sharing violation. Falls through to the outer catch
+      // (returns false, i.e. "nothing applied this round") once retries
+      // are exhausted, rather than crashing the whole pull.
+      const delays = [0, 150, 400];
+      for (let i = 0; i < delays.length; i++) {
+        if (delays[i] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delays[i]));
+        }
+        try {
+          await fs.copyFile(source, destination);
+          return true;
+        } catch (err) {
+          if (i === delays.length - 1) {
+            throw err;
+          }
+        }
+      }
+      return false;
     } catch {
       return false;
     }
@@ -405,21 +426,55 @@ export class SyncManager {
     }
   }
 
-  private async copyFile(source: string, destination: string, isSecret: boolean): Promise<void> {
+  /**
+   * A file OpenCode has open can hit a transient sharing violation on
+   * Windows even when nothing is logically wrong — SQLite briefly holding
+   * an exclusive handle mid-operation, antivirus scanning it, etc. A short
+   * retry absorbs that; failing after retries returns a message instead of
+   * throwing, so one locked file degrades to a skip rather than aborting
+   * the entire sync (which is what used to happen: a single copyfile error
+   * surfaced as a hard sync failure with nothing else touched).
+   */
+  private async copyFile(source: string, destination: string, isSecret: boolean): Promise<string | undefined> {
     await fs.mkdir(path.dirname(destination), { recursive: true });
 
-    // Redaction only ever touches session artifacts. Rewriting a config file
-    // would push a broken opencode.json that the other machine then applies.
-    if (isSecret && this.settings.redactSecrets && source.endsWith('.json')) {
-      await fs.writeFile(destination, sanitizeJsonFile(await fs.readFile(source, 'utf8')), 'utf8');
-      return;
+    const attempt = async () => {
+      // Redaction only ever touches session artifacts. Rewriting a config
+      // file would push a broken opencode.json the other machine applies.
+      if (isSecret && this.settings.redactSecrets && source.endsWith('.json')) {
+        await fs.writeFile(destination, sanitizeJsonFile(await fs.readFile(source, 'utf8')), 'utf8');
+        return;
+      }
+      await fs.copyFile(source, destination);
+    };
+
+    const delays = [0, 150, 400];
+    let lastError: unknown;
+    for (const delay of delays) {
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      try {
+        await attempt();
+        return undefined;
+      } catch (err) {
+        lastError = err;
+      }
     }
-    await fs.copyFile(source, destination);
+
+    const reason = lastError instanceof Error ? lastError.message : String(lastError);
+    return `Skipped ${path.basename(source)}: locked by another process (${reason}). Will retry on the next sync.`;
   }
 
-  private async copyTree(sourceDir: string, destinationDir: string, isSecret: boolean, prune: boolean): Promise<void> {
+  private async copyTree(
+    sourceDir: string,
+    destinationDir: string,
+    isSecret: boolean,
+    prune: boolean
+  ): Promise<string[]> {
     await fs.mkdir(destinationDir, { recursive: true });
     const seen = new Set<string>();
+    const messages: string[] = [];
 
     for (const entry of await readDirEntries(sourceDir)) {
       if (isVolatileName(entry.name)) {
@@ -430,20 +485,24 @@ export class SyncManager {
       const destination = path.join(destinationDir, entry.name);
 
       if (entry.isDirectory()) {
-        await this.copyTree(source, destination, isSecret, prune);
+        messages.push(...(await this.copyTree(source, destination, isSecret, prune)));
       } else if (entry.isFile()) {
-        await this.copyFile(source, destination, isSecret);
+        const failure = await this.copyFile(source, destination, isSecret);
+        if (failure) {
+          messages.push(failure);
+        }
       }
     }
 
     if (!prune) {
-      return;
+      return messages;
     }
     for (const entry of await readDirEntries(destinationDir)) {
       if (!seen.has(entry.name)) {
         await fs.rm(path.join(destinationDir, entry.name), { recursive: true, force: true });
       }
     }
+    return messages;
   }
 
   /**

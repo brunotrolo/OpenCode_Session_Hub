@@ -116,6 +116,11 @@ Safety rules that apply on every sync:
   effectively unsynced indefinitely while the panel still read "Synced".
   Use **Show Sync Debug Info** to check when `opencode.db` was actually
   last committed if you want to confirm this yourself.)
+- Any file copy — not just `opencode.db` — retries a few times before giving
+  up. On Windows a file OpenCode has open can throw a transient sharing
+  violation even after a successful checkpoint; that used to fail the
+  entire sync with nothing else committed. Now it degrades to a per-file
+  skip message and the rest of the sync still goes through.
 - Session directories **merge** rather than mirror — files missing locally are
   never deleted from the repo, so one machine can't wipe the other's history.
 - A local file edited since this machine's last successful pull is never
@@ -206,7 +211,7 @@ if you need them:
 ```bash
 npm install
 npm run compile
-npm test        # 72 tests: storage scanning, sanitizer, path mapping,
+npm test        # 73 tests: storage scanning, sanitizer, path mapping,
                 # two-machine sync simulation, extension activation,
                 # sidebar dashboard message protocol, favorite sessions
 ```
