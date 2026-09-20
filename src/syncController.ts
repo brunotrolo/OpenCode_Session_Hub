@@ -1,10 +1,10 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { buildDebugReport } from './debugInfo';
-import { addFavorite, FavoriteSession, loadFavorites, removeFavorite } from './favorites';
+import { addFavorite, FavoriteSession, loadFavorites, removeFavorite, removeFavoritesBySessionId } from './favorites';
 import { OpenCodeLocations, resolveOpenCodeLocations } from './opencodePaths';
 import { DirectoryMapping } from './pathMapper';
-import { scanSessions, SessionRecord } from './sessionScanner';
+import { deleteSession, scanSessions, SessionRecord } from './sessionScanner';
 import { SyncError, SyncManager, SyncOutcome, SyncRepoStatus, SyncSettings, SyncStatus } from './syncManager';
 
 export interface ControllerState {
@@ -93,6 +93,17 @@ export class SyncController {
 
   removeFavorite(id: string): void {
     removeFavorite(this.getLocations(), id);
+  }
+
+  /**
+   * Deletes a session's own files from this machine's storage and drops any
+   * favorite bookmarking it. Local-only: the sync repo and any other
+   * machine's copy are unaffected (see deleteSession()'s own note on why).
+   */
+  deleteSession(record: SessionRecord): void {
+    const locations = this.getLocations();
+    deleteSession(locations, record);
+    removeFavoritesBySessionId(locations, record.id);
   }
 
   async updateSetting(key: string, value: unknown): Promise<void> {

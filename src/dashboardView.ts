@@ -28,6 +28,7 @@ type Inbound =
     }
   | { type: 'previewSession'; id: string }
   | { type: 'resumeSession'; id: string }
+  | { type: 'deleteSession'; id: string }
   | { type: 'openFullList' }
   | { type: 'showDebugInfo' }
   | { type: 'saveFavorite'; label: string; sessionId: string }
@@ -123,6 +124,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           this.resumeById(message.id);
           return;
 
+        case 'deleteSession':
+          await this.deleteById(message.id);
+          return;
+
         case 'openFullList':
           await vscode.commands.executeCommand('opencodeSessionHub.listAllSessions');
           return;
@@ -202,6 +207,32 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     const terminal = vscode.window.createTerminal({ name: `OpenCode: ${record.title}`, cwd: directory });
     terminal.show();
     terminal.sendText(`opencode --session ${record.id}`);
+  }
+
+  /**
+   * Permanently removes a session's own files from this machine and drops
+   * any favorite bookmarking it. Deletion is local-only — see
+   * SyncController.deleteSession()'s note on why a sync repo copy or
+   * another machine's copy is intentionally left untouched.
+   */
+  private async deleteById(sessionId: string): Promise<void> {
+    const record = this.findSession(sessionId);
+    if (!record) {
+      vscode.window.showWarningMessage(`No session with id "${sessionId}" found on this machine.`);
+      return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+      `Delete "${record.title}" (${record.messageCount} messages) from this machine? This cannot be undone here, and will not remove it from the sync repository or other machines if it was already synced.`,
+      { modal: true },
+      'Delete'
+    );
+    if (choice !== 'Delete') {
+      return;
+    }
+
+    this.controller.deleteSession(record);
+    this.postState();
   }
 
   private postState(): void {
@@ -394,14 +425,16 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           '<div class="row">' +
           '<button class="secondary" data-action="preview" data-id="' + escapeHtml(s.id) + '">Preview</button>' +
           '<button class="secondary" data-action="resume" data-id="' + escapeHtml(s.id) + '">Resume</button>' +
+          '<button class="secondary" data-action="delete" data-id="' + escapeHtml(s.id) + '">Delete</button>' +
           '</div></li>').join('') + '</ul>'
       : '<p class="empty">No sessions found yet.</p>';
 
-    document.querySelectorAll('[data-action="preview"], [data-action="resume"]').forEach((btn) => {
+    const sessionActionMessage = { preview: 'previewSession', resume: 'resumeSession', delete: 'deleteSession' };
+    document.querySelectorAll('[data-action]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const action = btn.getAttribute('data-action');
         const id = btn.getAttribute('data-id');
-        vscode.postMessage({ type: action === 'preview' ? 'previewSession' : 'resumeSession', id });
+        vscode.postMessage({ type: sessionActionMessage[action], id });
       });
     });
 

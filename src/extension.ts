@@ -235,6 +235,7 @@ async function offerSessionActions(locations: OpenCodeLocations, record: Session
       { label: '$(preview) Preview Conversation', action: 'preview' as const },
       { label: '$(folder-opened) Open Folder in New Window', action: 'openFolder' as const },
       { label: '$(note) Generate Handoff Checkpoint', action: 'handoff' as const },
+      { label: '$(trash) Delete Session', action: 'delete' as const },
     ],
     { placeHolder: `${record.title} — ${directory}` }
   );
@@ -254,9 +255,31 @@ async function offerSessionActions(locations: OpenCodeLocations, record: Session
     case 'handoff':
       writeHandoff(locations, record, directory);
       break;
+    case 'delete':
+      await deleteSessionCommand(record);
+      break;
     default:
       break;
   }
+}
+
+/**
+ * Local-only, same as the dashboard's Delete button: removes the session's
+ * own files and any favorite bookmarking it, but never touches the sync
+ * repo or another machine's copy (session dirs merge rather than mirror on
+ * purpose, so nothing here is asked to propagate a deletion).
+ */
+async function deleteSessionCommand(record: SessionRecord) {
+  const choice = await vscode.window.showWarningMessage(
+    `Delete "${record.title}" (${record.messageCount} messages) from this machine? This cannot be undone here, and will not remove it from the sync repository or other machines if it was already synced.`,
+    { modal: true },
+    'Delete'
+  );
+  if (choice !== 'Delete') {
+    return;
+  }
+  controller.deleteSession(record);
+  vscode.window.showInformationMessage(`Deleted "${record.title}".`);
 }
 
 function openInTerminal(record: SessionRecord, directory: string) {
