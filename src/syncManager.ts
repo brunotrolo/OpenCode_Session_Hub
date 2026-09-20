@@ -1,8 +1,9 @@
 import { spawn } from 'child_process';
-import { Dirent } from 'fs';
+import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { buildSyncPlan, OpenCodeLocations, SyncItem } from './opencodePaths';
+import { mergeSessionDatabases } from './dbMerge';
+import { buildSyncPlan, OpenCodeLocations, SESSION_DB_REPO_PATH, SyncItem } from './opencodePaths';
 import { sanitizeJsonFile } from './secretSanitizer';
 
 export type SyncStatus = 'idle' | 'syncing' | 'error' | 'unconfigured' | 'conflict';
@@ -111,27 +112,124 @@ export class SyncManager {
   }
 
   /** Fetches the remote branch and merges it into the local mirror. */
-  private async fetchAndIntegrate(): Promise<{ conflicted: boolean }> {
+  private async fetchAndIntegrate(): Promise<{ conflicted: boolean; messages: string[] }> {
     const fetch = await this.git(['fetch', 'origin', this.settings.branch], { allowFailure: true });
     if (fetch.code !== 0) {
       // A freshly created empty remote has no branch yet; not an error.
-      return { conflicted: false };
+      return { conflicted: false, messages: [] };
     }
 
     if ((await this.git(['rev-parse', '--verify', 'HEAD'], { allowFailure: true })).code !== 0) {
       await this.git(['checkout', '-B', this.settings.branch, `origin/${this.settings.branch}`]);
-      return { conflicted: false };
+      return { conflicted: false, messages: [] };
     }
 
     const merge = await this.git(['merge', '--no-edit', `origin/${this.settings.branch}`], { allowFailure: true });
-    return { conflicted: merge.code !== 0 };
+    if (merge.code === 0) {
+      return { conflicted: false, messages: [] };
+    }
+
+    return this.tryAutoResolveDatabaseConflict();
+  }
+
+  /**
+   * opencode.db is a binary file, so git can only offer "keep local" or "keep
+   * remote" on it — either choice silently drops every session the other
+   * machine created since the last sync. Before surfacing the conflict to the
+   * user, try a session-level merge (see dbMerge.ts) of just that file: if it
+   * succeeds and nothing else is conflicted, the merge finishes on its own
+   * with no data lost and no user action needed.
+   */
+  private async tryAutoResolveDatabaseConflict(): Promise<{ conflicted: boolean; messages: string[] }> {
+    const messages: string[] = [];
+    const conflicted = await this.listConflictedFiles();
+
+    if (conflicted.includes(SESSION_DB_REPO_PATH)) {
+      if (await this.mergeConflictedDatabase()) {
+        await this.git(['add', '--', SESSION_DB_REPO_PATH]);
+        messages.push(
+          `Merged ${SESSION_DB_REPO_PATH} automatically at the session level instead of picking one machine's copy.`
+        );
+      } else {
+        messages.push(`Could not auto-merge ${SESSION_DB_REPO_PATH}; resolve it manually.`);
+      }
+    }
+
+    const remaining = await this.listConflictedFiles();
+    if (remaining.length === 0) {
+      await this.git(['commit', '--no-edit'], { allowFailure: true });
+      return { conflicted: false, messages };
+    }
+
+    return { conflicted: true, messages };
+  }
+
+  private async listConflictedFiles(): Promise<string[]> {
+    return (await this.git(['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })).stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * During a merge, `:2:<path>` is this machine's pre-merge copy ("ours") and
+   * `:3:<path>` is the incoming remote copy ("theirs"). Both are extracted
+   * with `git show` piped straight to a file — never through a string, which
+   * would corrupt SQLite's binary content — merged row-by-row, and the result
+   * replaces the working-tree copy so it can be staged like any other
+   * resolved file.
+   */
+  private async mergeConflictedDatabase(): Promise<boolean> {
+    const repoPath = path.join(this.repoDir, ...SESSION_DB_REPO_PATH.split('/'));
+    const oursTmp = `${repoPath}.merge-ours.tmp`;
+    const theirsTmp = `${repoPath}.merge-theirs.tmp`;
+
+    try {
+      const [oursOk, theirsOk] = await Promise.all([
+        this.gitShowToFile(`:2:${SESSION_DB_REPO_PATH}`, oursTmp),
+        this.gitShowToFile(`:3:${SESSION_DB_REPO_PATH}`, theirsTmp),
+      ]);
+      if (!oursOk || !theirsOk) {
+        return false;
+      }
+      if (mergeSessionDatabases(oursTmp, theirsTmp) === null) {
+        return false;
+      }
+      await fs.copyFile(oursTmp, repoPath);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await fs.rm(oursTmp, { force: true });
+      await fs.rm(theirsTmp, { force: true });
+    }
+  }
+
+  private gitShowToFile(spec: string, destPath: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const out = createWriteStream(destPath);
+      const child = spawn('git', ['show', spec], { cwd: this.repoDir });
+      let failed = false;
+      child.on('error', () => {
+        failed = true;
+      });
+      child.stdout.pipe(out);
+      child.stdout.on('error', () => {
+        failed = true;
+      });
+      child.on('close', (code) => {
+        out.close(() => resolve(!failed && code === 0));
+      });
+    });
   }
 
   async push(): Promise<SyncOutcome> {
     await this.ensureRepo();
     const { items, messages } = this.effectivePlan();
 
-    if ((await this.fetchAndIntegrate()).conflicted) {
+    const integration = await this.fetchAndIntegrate();
+    messages.push(...integration.messages);
+    if (integration.conflicted) {
       return { status: 'conflict', messages: [...messages, CONFLICT_HINT], changedFiles: 0 };
     }
 
@@ -139,14 +237,41 @@ export class SyncManager {
 
     await this.git(['add', '-A']);
     const staged = (await this.git(['diff', '--cached', '--name-only'])).stdout.trim();
-    if (!staged) {
+    if (staged) {
+      await this.git(['commit', '-m', `sync: ${new Date().toISOString()}`]);
+    }
+
+    // A just-finished conflict merge (tryAutoResolveDatabaseConflict) commits
+    // locally but never pushes, so checking only "anything staged this round"
+    // would miss it: HEAD can already be ahead of origin with nothing left to
+    // stage. Leaving that commit unpushed would mean the next machine to sync
+    // hits the exact same conflict all over again.
+    const ahead = await this.commitsAheadOfOrigin();
+    if (!staged && ahead === 0) {
       return { status: 'no-changes', messages, changedFiles: 0 };
     }
 
-    await this.git(['commit', '-m', `sync: ${new Date().toISOString()}`]);
     await this.git(['push', '-u', 'origin', this.settings.branch]);
 
-    return { status: 'ok', messages, changedFiles: staged.split('\n').length };
+    return { status: 'ok', messages, changedFiles: staged ? staged.split('\n').length : 0 };
+  }
+
+  /** origin/<branch> is a remote-tracking ref refreshed by fetchAndIntegrate's own fetch. */
+  private async commitsAheadOfOrigin(): Promise<number> {
+    if ((await this.git(['rev-parse', '--verify', 'HEAD'], { allowFailure: true })).code !== 0) {
+      // No commits at all yet (e.g. nothing was ever staged) — nothing to push.
+      return 0;
+    }
+    const result = await this.git(['rev-list', '--count', `origin/${this.settings.branch}..HEAD`], {
+      allowFailure: true,
+    });
+    if (result.code !== 0) {
+      // HEAD exists but there's no local origin/<branch> ref yet — the very
+      // first real push to a brand-new remote. There's clearly something to push.
+      return 1;
+    }
+    const count = Number(result.stdout.trim());
+    return Number.isFinite(count) ? count : 0;
   }
 
   /**
@@ -158,7 +283,9 @@ export class SyncManager {
     await this.ensureRepo();
     const { items, messages } = this.effectivePlan();
 
-    if ((await this.fetchAndIntegrate()).conflicted) {
+    const integration = await this.fetchAndIntegrate();
+    messages.push(...integration.messages);
+    if (integration.conflicted) {
       return { status: 'conflict', messages: [...messages, CONFLICT_HINT], changedFiles: 0 };
     }
 
@@ -177,14 +304,24 @@ export class SyncManager {
    */
   async resolveConflicts(keep: 'local' | 'remote'): Promise<SyncOutcome> {
     await this.ensureRepo();
-    const conflicted = (await this.git(['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })).stdout
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
+    let conflicted = await this.listConflictedFiles();
 
     if (conflicted.length === 0) {
       await this.git(['merge', '--abort'], { allowFailure: true });
       return { status: 'no-changes', messages: ['No conflicted files to resolve.'], changedFiles: 0 };
+    }
+
+    const messages: string[] = [];
+    const totalConflicted = conflicted.length;
+
+    // The database gets a real session-level merge instead of "pick a side,"
+    // which would otherwise discard whichever machine's sessions weren't kept.
+    if (conflicted.includes(SESSION_DB_REPO_PATH) && (await this.mergeConflictedDatabase())) {
+      await this.git(['add', '--', SESSION_DB_REPO_PATH]);
+      messages.push(
+        `Merged ${SESSION_DB_REPO_PATH} automatically at the session level instead of picking one machine's copy.`
+      );
+      conflicted = conflicted.filter((file) => file !== SESSION_DB_REPO_PATH);
     }
 
     // During a merge, --ours is this machine's mirror and --theirs is the remote.
@@ -195,7 +332,9 @@ export class SyncManager {
     }
     await this.git(['commit', '--no-edit'], { allowFailure: true });
 
-    const messages = [`Resolved ${conflicted.length} conflicted file(s), keeping the ${keep} version.`];
+    if (conflicted.length > 0) {
+      messages.push(`Resolved ${conflicted.length} conflicted file(s), keeping the ${keep} version.`);
+    }
 
     const { items } = this.effectivePlan();
     const applied = await this.applyFromRepo(items);
@@ -208,7 +347,7 @@ export class SyncManager {
       );
     }
 
-    return { status: 'ok', messages, changedFiles: conflicted.length };
+    return { status: 'ok', messages, changedFiles: totalConflicted };
   }
 
   async status(): Promise<SyncRepoStatus> {
@@ -286,6 +425,20 @@ export class SyncManager {
           );
           continue;
         }
+
+        // The mirror's copy of opencode.db may already hold a same-push merge
+        // resolution (see tryAutoResolveDatabaseConflict), or rows from a
+        // machine this one hasn't pulled from yet. A plain overwrite here
+        // would silently discard those rows; merging the local file's rows
+        // into the existing mirror instead keeps both.
+        if (item.repoPath === SESSION_DB_REPO_PATH && (await exists(destination))) {
+          if (mergeSessionDatabases(destination, item.localPath) !== null) {
+            continue;
+          }
+          // node:sqlite unavailable or either file unreadable: fall through
+          // to the old overwrite behavior rather than skipping the sync.
+        }
+
         const failure = await this.copyFile(item.localPath, destination, item.isSecret);
         if (failure) {
           messages.push(failure);
@@ -317,6 +470,24 @@ export class SyncManager {
       if (!(await exists(source))) {
         continue;
       }
+
+      // opencode.db gets merged rather than mtime-gated like other files: the
+      // mtime guard exists to protect a local edit made since the last pull,
+      // but during an active session the database is touched constantly, so
+      // that guard would block every incoming session forever. A merge can't
+      // "clobber" a local row — it only adds rows or replaces one with a
+      // strictly newer version of itself — so the guard's protection isn't
+      // needed here in the first place.
+      if (item.type === 'file' && item.repoPath === SESSION_DB_REPO_PATH && (await exists(item.localPath))) {
+        const merged = mergeSessionDatabases(item.localPath, source);
+        if (merged !== null) {
+          count += merged > 0 ? 1 : 0;
+          continue;
+        }
+        // node:sqlite unavailable or a file unreadable: fall through to the
+        // old mtime-gated overwrite rather than skipping the sync entirely.
+      }
+
       count +=
         item.type === 'file'
           ? (await this.applyFile(source, item.localPath, lastPullAt))

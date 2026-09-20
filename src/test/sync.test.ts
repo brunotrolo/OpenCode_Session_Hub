@@ -7,7 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import { resolveOpenCodeLocations } from '../opencodePaths';
 import { scanSessions } from '../sessionScanner';
 import { SyncManager, SyncSettings } from '../syncManager';
-import { addStorageSession, createMachine, FakeMachine, writeJson } from './fixtures';
+import { addSqliteSession, addStorageSession, createMachine, FakeMachine, writeJson } from './fixtures';
 
 /**
  * End-to-end simulation: machine A pushes to a bare repo, machine B pulls,
@@ -313,6 +313,132 @@ describe('two-machine sync simulation', () => {
       fs.readFileSync(path.join(laptop.configRoot, 'AGENTS.md'), 'utf8'),
       '# edited on laptop after pulling\n'
     );
+  });
+
+  it('merges two machines pushing different sessions in sequence without ever conflicting', async () => {
+    // The common case: two machines push at different times, neither aware
+    // of the other's new session. Because mirrorToRepo now merges the
+    // database into the mirror's existing copy instead of overwriting it,
+    // this never even reaches git's binary-conflict path — both sessions
+    // simply end up in the mirror.
+    const dbRemote = path.join(root, 'db-sequential-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', dbRemote]);
+
+    const alice = createMachine(root, 'db-sequential-alice');
+    const bob = createMachine(root, 'db-sequential-bob');
+    const aliceManager = managerFor(alice, { remoteUrl: dbRemote });
+    const bobManager = managerFor(bob, { remoteUrl: dbRemote });
+
+    addSqliteSession(alice, {
+      sessionId: 'ses_shared',
+      projectId: 'prj_shared',
+      title: 'Shared starting session',
+      directory: '/shared/project',
+      updated: 1_700_000_000_000,
+    });
+    await aliceManager.push();
+    await bobManager.pull();
+
+    addSqliteSession(bob, {
+      sessionId: 'ses_bob_only',
+      projectId: 'prj_shared',
+      title: "Bob's session",
+      directory: '/shared/project',
+      updated: 1_700_000_600_000,
+      messages: [{ id: 'msg_bob', role: 'user', text: 'question only bob asked', created: 1_700_000_600_000 }],
+    });
+    const bobPush = await bobManager.push();
+    assert.strictEqual(bobPush.status, 'ok');
+
+    addSqliteSession(alice, {
+      sessionId: 'ses_alice_only',
+      projectId: 'prj_shared',
+      title: "Alice's session",
+      directory: '/shared/project',
+      updated: 1_700_000_500_000,
+      messages: [{ id: 'msg_alice', role: 'user', text: 'question only alice asked', created: 1_700_000_500_000 }],
+    });
+    const alicePush = await aliceManager.push();
+    assert.notStrictEqual(alicePush.status, 'conflict', alicePush.messages.join(' | '));
+
+    await bobManager.pull();
+    const bobSessions = scanSessions(resolveOpenCodeLocations(bob.env, 'linux')).sessions.map((s) => s.id);
+    assert.ok(bobSessions.includes('ses_alice_only'), bobSessions.join(', '));
+    assert.ok(bobSessions.includes('ses_bob_only'), bobSessions.join(', '));
+  });
+
+  it('merges opencode.db at the session level instead of discarding one machine\'s history on a real binary conflict', async () => {
+    const dbRemote = path.join(root, 'db-conflict-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', dbRemote]);
+
+    const alice = createMachine(root, 'db-conflict-alice');
+    const bob = createMachine(root, 'db-conflict-bob');
+    const aliceManager = managerFor(alice, { remoteUrl: dbRemote });
+    const bobManager = managerFor(bob, { remoteUrl: dbRemote });
+    const bobRepoDir = path.join(bob.home, 'sync-repo');
+    const bobMirrorDbPath = path.join(bobRepoDir, 'data', 'opencode.db');
+
+    addSqliteSession(alice, {
+      sessionId: 'ses_shared',
+      projectId: 'prj_shared',
+      title: 'Shared starting session',
+      directory: '/shared/project',
+      updated: 1_700_000_000_000,
+    });
+    await aliceManager.push(); // origin now holds commit A1 (ses_shared)
+    await bobManager.pull(); // bob's mirror fast-forwards to A1
+
+    // Simulate the real-world failure this is meant to survive: bob's own
+    // sync previously got as far as committing locally, then lost network
+    // before `git push` — a genuine local commit that never reached origin.
+    addSqliteSession(bob, {
+      sessionId: 'ses_bob_only',
+      projectId: 'prj_shared',
+      title: "Bob's session",
+      directory: '/shared/project',
+      updated: 1_700_000_600_000,
+      messages: [{ id: 'msg_bob', role: 'user', text: 'question only bob asked', created: 1_700_000_600_000 }],
+    });
+    fs.copyFileSync(path.join(bob.dataRoot, 'opencode.db'), bobMirrorDbPath);
+    spawnSync('git', ['-C', bobRepoDir, 'add', '-A']);
+    spawnSync('git', ['-C', bobRepoDir, 'commit', '-m', "bob's unpushed local commit"]);
+
+    // Meanwhile alice, unaware of bob's unpushed commit, pushes her own
+    // change based on the same shared ancestor (A1) — a real divergence.
+    addSqliteSession(alice, {
+      sessionId: 'ses_alice_only',
+      projectId: 'prj_shared',
+      title: "Alice's session",
+      directory: '/shared/project',
+      updated: 1_700_000_500_000,
+      messages: [{ id: 'msg_alice', role: 'user', text: 'question only alice asked', created: 1_700_000_500_000 }],
+    });
+    const alicePush = await aliceManager.push();
+    assert.strictEqual(alicePush.status, 'ok');
+
+    // Bob's next push must fetch alice's diverging commit, hit a genuine
+    // binary conflict merging it against his own unpushed commit, and
+    // auto-resolve it by merging sessions instead of picking a side.
+    const bobPush = await bobManager.push();
+
+    assert.notStrictEqual(bobPush.status, 'conflict', bobPush.messages.join(' | '));
+    assert.ok(
+      bobPush.messages.some((m) => m.includes('Merged') && m.includes('opencode.db')),
+      bobPush.messages.join(' | ')
+    );
+
+    // push() only mirrors local -> repo; the merge result lands in bob's own
+    // OpenCode storage on his next pull, same as any other machine's changes.
+    await bobManager.pull();
+    const bobSessions = scanSessions(resolveOpenCodeLocations(bob.env, 'linux')).sessions.map((s) => s.id);
+    assert.ok(bobSessions.includes('ses_alice_only'), bobSessions.join(', '));
+    assert.ok(bobSessions.includes('ses_bob_only'), bobSessions.join(', '));
+
+    // And once alice pulls, she must pick up bob's session without losing her own.
+    await aliceManager.pull();
+    const aliceSessions = scanSessions(resolveOpenCodeLocations(alice.env, 'linux')).sessions.map((s) => s.id);
+    assert.ok(aliceSessions.includes('ses_alice_only'), aliceSessions.join(', '));
+    assert.ok(aliceSessions.includes('ses_bob_only'), aliceSessions.join(', '));
   });
 
   it('exposes ahead/behind status', async () => {

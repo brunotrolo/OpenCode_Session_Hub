@@ -44,8 +44,28 @@ Key safety properties, implemented in `syncManager.ts`:
 - **Local-edit protection**: a file touched since this machine's last
   successful pull is never overwritten by a later pull (except the very
   first pull ever, which adopts the remote unconditionally).
-- **Conflict resolution** applies the winning side to local disk and pushes
-  it, so the same conflict doesn't reappear next sync.
+- **Session-level merge for `opencode.db`** (`dbMerge.ts`): `opencode.db` is
+  a single binary SQLite file, so a plain `git merge` can only offer "keep
+  local" or "keep remote" on it — either choice silently discards every
+  session the other machine created since the last sync. Instead, both a
+  push (`mirrorToRepo`) and a pull (`applyFromRepo`) merge the two
+  databases' `session`/`message`/`part`/`project` tables row-by-row, keyed
+  by id with the newer `time_updated` winning on an actual collision. This
+  also runs automatically when `git merge` itself reports a real conflict on
+  `data/opencode.db` (`tryAutoResolveDatabaseConflict`, invoked from
+  `fetchAndIntegrate`): the two conflicting blobs are extracted with `git
+  show :2:`/`:3:` (never through a string — that would corrupt the binary
+  content), merged, and re-staged, finishing the merge with no data lost and
+  no user action needed. Because merging can leave the local git branch
+  ahead of `origin` with nothing new to *stage* that round, `push()` checks
+  `commitsAheadOfOrigin()` in addition to "anything staged," so that
+  resolution commit still gets pushed instead of stranding it locally.
+  Falls back to the old whole-file "keep a side" behavior if `node:sqlite`
+  is unavailable (Node < 22.5) or a database can't be read.
+- **Conflict resolution** (`OpenCode Sync: Resolve Conflicts`, for whatever
+  isn't already handled by the automatic database merge above) applies the
+  winning side to local disk and pushes it, so the same conflict doesn't
+  reappear next sync.
 
 `OpenCode: Show Sync Debug Info` (also a button in the panel) surfaces the
 facts a green "Synced" badge can hide — e.g. when `opencode.db` was actually
