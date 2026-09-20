@@ -128,6 +128,9 @@ const CONFIG_DIRS = [
   'plugin',
   'plugins',
 ];
+/** Repo-relative path of the mirrored SQLite database — shared with dbMerge.ts so a conflict on it can be recognized by name. */
+export const SESSION_DB_REPO_PATH = 'data/opencode.db';
+
 /** Session artifact directories, relative to the OpenCode data root. */
 const SESSION_DIRS = [
   path.posix.join('storage', 'session'),
@@ -194,7 +197,7 @@ export function buildSyncPlan(locations: OpenCodeLocations, options: SyncPlanOpt
   if (options.includeSecrets && options.includeSessions) {
     items.push({
       localPath: locations.databasePath,
-      repoPath: 'data/opencode.db',
+      repoPath: SESSION_DB_REPO_PATH,
       type: 'file',
       isSecret: true,
     });
