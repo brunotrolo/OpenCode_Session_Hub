@@ -44,6 +44,10 @@
         "title": "OpenCode: Open Session Hub Panel"
       },
       {
+        "command": "opencodeSessionHub.showDebugInfo",
+        "title": "OpenCode: Show Sync Debug Info"
+      },
+      {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"
       },

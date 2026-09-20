@@ -47,6 +47,7 @@ export function activate(context: vscode.ExtensionContext) {
   register('opencodeSessionHub.openDashboard', async () => {
     await vscode.commands.executeCommand('workbench.view.extension.opencodeSessionHub');
   });
+  register('opencodeSessionHub.showDebugInfo', () => showDebugInfo());
 
   const config = vscode.workspace.getConfiguration('opencodeSessionHub');
   if (config.get<boolean>('autoPullOnStartup', true) && controller.getSettings().remoteUrl) {
@@ -138,6 +139,18 @@ async function initOrLink(mode: 'init' | 'link') {
     const message = err instanceof SyncError ? err.message : String(err);
     vscode.window.showErrorMessage(`OpenCode sync ${mode} failed: ${message}`);
   }
+}
+
+async function showDebugInfo() {
+  const report = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Window, title: 'OpenCode: gathering debug info' },
+    () => controller.buildDebugReport()
+  );
+
+  output.appendLine('');
+  output.appendLine(report);
+  output.show(true);
+  vscode.window.showInformationMessage('OpenCode Session Hub debug info written to the Output panel.');
 }
 
 async function showSyncStatus() {
