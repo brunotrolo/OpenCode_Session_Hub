@@ -1,0 +1,99 @@
+{
+  "name": "opencode-session-hub",
+  "displayName": "OpenCode Session Hub",
+  "description": "Browse every OpenCode session on your machine and keep them synced across workstations via a private Git repository.",
+  "version": "0.1.0",
+  "publisher": "opencode-session-hub",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencodeSessionHub.listAllSessions",
+        "title": "OpenCode: List All Sessions (All Projects)"
+      },
+      {
+        "command": "opencodeSessionHub.previewSession",
+        "title": "OpenCode: Preview Session"
+      },
+      {
+        "command": "opencodeSessionHub.syncPush",
+        "title": "OpenCode Sync: Push Now"
+      },
+      {
+        "command": "opencodeSessionHub.syncPull",
+        "title": "OpenCode Sync: Pull Now"
+      },
+      {
+        "command": "opencodeSessionHub.syncInit",
+        "title": "OpenCode Sync: Initialize Sync Repository"
+      },
+      {
+        "command": "opencodeSessionHub.generateHandoff",
+        "title": "OpenCode: Generate Handoff Checkpoint"
+      },
+      {
+        "command": "opencodeSessionHub.searchSessions",
+        "title": "OpenCode: Search All Session History"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode Session Hub",
+      "properties": {
+        "opencodeSessionHub.storagePath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the OpenCode global storage directory. Leave empty to auto-detect (~/.local/share/opencode on Linux/macOS, %LOCALAPPDATA%\\opencode on Windows)."
+        },
+        "opencodeSessionHub.syncRepoPath": {
+          "type": "string",
+          "default": "",
+          "description": "Local path used to mirror the sync repository. Leave empty to use the extension's global storage folder."
+        },
+        "opencodeSessionHub.syncRemoteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Git remote URL of the private sync repository (e.g. git@github.com:you/my-opencode-sync.git)."
+        },
+        "opencodeSessionHub.autoSyncOnFocusLost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically push session state when the VS Code window loses focus (debounced)."
+        },
+        "opencodeSessionHub.autoPullOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically pull the latest session state when VS Code starts."
+        },
+        "opencodeSessionHub.debounceSeconds": {
+          "type": "number",
+          "default": 20,
+          "description": "Seconds of inactivity to wait before auto-pushing changes."
+        },
+        "opencodeSessionHub.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strip API keys, tokens and other credential-shaped strings from session data before syncing."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
