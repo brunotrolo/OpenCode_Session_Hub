@@ -90,6 +90,7 @@ export class SyncManager {
     }
 
     await fs.mkdir(this.repoDir, { recursive: true });
+    await this.clearStaleIndexLock();
 
     if (!(await exists(path.join(this.repoDir, '.git')))) {
       await this.git(['init', '-b', this.settings.branch]);
@@ -118,6 +119,29 @@ export class SyncManager {
     // share that setting. This repo's own config always wins over the user's
     // global one, so pin it off regardless of what the user has set globally.
     await this.git(['config', 'core.autocrlf', 'false']);
+  }
+
+  /**
+   * Removes `.git/index.lock` if it's old enough to be almost certainly
+   * stale (see STALE_INDEX_LOCK_AGE_MS) rather than a real concurrent `git`
+   * process. Plain git leaves this lock behind forever if the process
+   * holding it is killed mid-operation — VS Code force-quit, a crashed
+   * extension host, or (before OVERSIZED_FILE_SKIP_BYTES existed) a `git
+   * add` on a multi-GB file outliving a debounced sync that got superseded.
+   * Without this, every sync attempt from then on fails identically, with
+   * no way to recover short of the user finding and deleting the file by
+   * hand.
+   */
+  private async clearStaleIndexLock(): Promise<void> {
+    const lockPath = path.join(this.repoDir, '.git', 'index.lock');
+    const stat = await statOrNull(lockPath);
+    if (!stat) {
+      return;
+    }
+    if (Date.now() - stat.mtimeMs < STALE_INDEX_LOCK_AGE_MS) {
+      return;
+    }
+    await fs.rm(lockPath, { force: true }).catch(() => undefined);
   }
 
   /** Fetches the remote branch and merges it into the local mirror. */
@@ -396,6 +420,10 @@ export class SyncManager {
 
     if (!repoExists) {
       lines.push('Local mirror has not been created yet (no push/pull has run).');
+      // File-size checks read local OpenCode paths, not the mirror, so they're
+      // worth showing even before the first sync — a user hitting the size
+      // limit on their very first push deserves the same answer as anyone else.
+      lines.push(await this.oversizedFileSummary());
       return lines.join('\n');
     }
 
@@ -413,7 +441,50 @@ export class SyncManager {
       `Last successful pull completed on this machine: ${lastPullAt ? new Date(lastPullAt).toISOString() : '(never)'}`
     );
 
+    const lockPath = path.join(this.repoDir, '.git', 'index.lock');
+    const lockStat = await statOrNull(lockPath);
+    if (lockStat) {
+      const ageMs = Date.now() - lockStat.mtimeMs;
+      const stale = ageMs >= STALE_INDEX_LOCK_AGE_MS;
+      lines.push(
+        `index.lock: PRESENT, ${Math.round(ageMs / 1000)}s old — ${
+          stale
+            ? 'stale (older than the auto-clear threshold; the next sync attempt removes it automatically).'
+            : 'recent enough that it might be a real sync in progress right now. If every sync has failed with a lock error for longer than this, close VS Code, confirm no git process is running for this repo, then delete this file by hand.'
+        }`
+      );
+    } else {
+      lines.push('index.lock: absent.');
+    }
+
+    lines.push(await this.oversizedFileSummary());
+
     return lines.join('\n');
+  }
+
+  /**
+   * Flags any file this tool is configured to sync that's already over the
+   * skip threshold, independent of whether a sync has actually run recently
+   * — so this shows up in the debug report even right after opening OpenCode
+   * for the first time, before ever clicking Push.
+   */
+  private async oversizedFileSummary(): Promise<string> {
+    const limitMb = OVERSIZED_FILE_SKIP_BYTES / (1024 * 1024);
+    const { items } = this.effectivePlan();
+    const oversized: string[] = [];
+    for (const item of items) {
+      if (item.type !== 'file') {
+        continue;
+      }
+      const stat = await statOrNull(item.localPath);
+      if (stat && stat.size > OVERSIZED_FILE_SKIP_BYTES) {
+        oversized.push(`${item.repoPath}: ${(stat.size / (1024 * 1024)).toFixed(0)} MB`);
+      }
+    }
+    if (oversized.length === 0) {
+      return `Oversized files (> ${limitMb} MB, skipped by every sync): none.`;
+    }
+    return `Oversized files (> ${limitMb} MB, skipped by every sync):\n  ${oversized.join('\n  ')}`;
   }
 
   // --------------------------------------------------------------- mirror ---
@@ -432,6 +503,12 @@ export class SyncManager {
           messages.push(
             `Skipped ${path.basename(item.localPath)}: uncheckpointed SQLite writes (-wal) are present. Close OpenCode and sync again.`
           );
+          continue;
+        }
+
+        const oversized = await this.checkOversizedFile(item.localPath);
+        if (oversized) {
+          messages.push(oversized);
           continue;
         }
 
@@ -704,6 +781,28 @@ export class SyncManager {
    * a complete, consistent snapshot; a leftover WAL file at that point is
    * just reusable space SQLite hasn't cleared yet, not missing data.
    */
+  /**
+   * See OVERSIZED_FILE_SKIP_BYTES: a file this large is either going to be
+   * rejected by GitHub outright or spend real time/disk being hashed and
+   * compressed by git first. Skipping it here means the sync repo and the
+   * user's bandwidth never pay that cost, and the resulting message is the
+   * direct, actionable answer to "why didn't this sync" instead of a lock
+   * timeout or a push rejection with no obvious cause.
+   */
+  private async checkOversizedFile(filePath: string): Promise<string | undefined> {
+    const stat = await statOrNull(filePath);
+    if (!stat || stat.size <= OVERSIZED_FILE_SKIP_BYTES) {
+      return undefined;
+    }
+    const actualMb = (stat.size / (1024 * 1024)).toFixed(0);
+    const limitMb = OVERSIZED_FILE_SKIP_BYTES / (1024 * 1024);
+    return (
+      `Skipped ${path.basename(filePath)}: ${actualMb} MB exceeds the ${limitMb} MB sync limit ` +
+      '(GitHub rejects any single file over 100 MB, and git would spend real time hashing it first). ' +
+      'If this is opencode.db, try VACUUMing it or trimming old sessions.'
+    );
+  }
+
   private async isVolatile(filePath: string): Promise<boolean> {
     if (isVolatileName(filePath)) {
       return true;
@@ -744,6 +843,28 @@ const CONFLICT_HINT = 'The sync repository has conflicting changes. Run "OpenCod
 
 /** Covers common 1-second mtime truncation on overlay/network filesystems. */
 const MTIME_SAFETY_MARGIN_MS = 2000;
+
+/**
+ * GitHub hard-rejects any single file over 100 MiB on push, and `git add`
+ * fully re-hashes and re-compresses a changed binary file on every commit
+ * (no binary diffing), so a multi-GB opencode.db doesn't just fail to push —
+ * it can spend minutes doing that work locally first, on every sync attempt.
+ * Skipping well under the hard limit avoids both: the wasted local work and
+ * a push that was always going to be rejected.
+ */
+const OVERSIZED_FILE_SKIP_BYTES = 90 * 1024 * 1024;
+
+/**
+ * How long a `.git/index.lock` has to sit untouched before it's treated as
+ * stale rather than a real concurrent operation. Plain `git` doesn't record
+ * which process holds this lock (unlike opencode-synced's own PID-tagged
+ * lock file), so age is the only signal available — but the
+ * OVERSIZED_FILE_SKIP_BYTES guard above means no operation this tool runs
+ * should legitimately hold it for anywhere near this long, so it's safe to
+ * break. A lock left behind by a crashed VS Code process or a killed git
+ * child otherwise never clears itself, permanently blocking every sync.
+ */
+const STALE_INDEX_LOCK_AGE_MS = 2 * 60 * 1000;
 
 function isVolatileName(name: string): boolean {
   return VOLATILE_SUFFIXES.some((suffix) => name.endsWith(suffix));

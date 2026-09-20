@@ -51,6 +51,33 @@ Key safety properties, implemented in `syncManager.ts`:
   path typed on a Windows + Git Bash/WSL setup), so they're joined with
   `joinPreservingStyle`, not `path.join`, which would silently normalize
   them to the host's native separator and produce a path that never matches.
+- **Oversized-file skip** (`OVERSIZED_FILE_SKIP_BYTES`, 90 MB): GitHub
+  hard-rejects any single file over 100 MB, and `git add` fully re-hashes and
+  re-compresses a changed binary file on every commit (no binary diffing) —
+  so an `opencode.db` that's grown into the hundreds of MB or GB doesn't just
+  fail to push, it can spend real time and disk doing that work first, on
+  every sync attempt. `mirrorToRepo` skips any file over the limit before
+  either the merge or copy path touches it, with a clear per-sync message
+  (`checkOversizedFile`) and a standing entry in the debug report
+  (`oversizedFileSummary`) that shows up even before the first sync ever
+  runs. `opencode-synced` solves the same problem more completely with a
+  chunking scheme (`src/sync/chunks.ts`, files up to 4 GB); this is the
+  narrower fix — surface the problem clearly and never make it worse,
+  without taking on chunking's complexity.
+- **Stale `.git/index.lock` recovery** (`clearStaleIndexLock`,
+  `STALE_INDEX_LOCK_AGE_MS` = 2 minutes): plain git leaves this lock behind
+  forever if the process holding it is killed mid-operation (VS Code
+  force-quit, a crashed extension host, or — before the size skip above
+  existed — a `git add` on a multi-GB file outliving a superseded debounced
+  sync). Every sync after that fails identically with no way to recover
+  short of finding and deleting the file by hand. `ensureRepo()` checks the
+  lock's age on every call and removes it if it's older than the threshold;
+  a fresh lock is left alone so a real concurrent operation isn't raced.
+  Plain git doesn't record which process holds this lock the way
+  `opencode-synced`'s own PID-tagged lock file does (`src/sync/lock.ts`), so
+  age is the only signal available here — safe specifically because the size
+  skip above means no legitimate operation should hold it anywhere near this
+  long.
 - **Merge, not mirror, for session directories**: a file missing locally is
   never deleted from the repo, so one machine can't wipe another's history.
 - **Local-edit protection**: a file touched since this machine's last

@@ -1,6 +1,11 @@
+import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import { OpenCodeLocations } from './opencodePaths';
 import { SyncManager, SyncSettings } from './syncManager';
+
+/** Matches OVERSIZED_FILE_SKIP_BYTES in syncManager.ts — kept as a literal here so this module doesn't need to import an internal constant just to word a warning. */
+const OVERSIZED_FILE_SKIP_MB = 90;
 
 /**
  * The exact question this exists to answer: "the panel says Synced — do I
@@ -19,6 +24,13 @@ export async function buildDebugReport(
   const lines: string[] = [];
   lines.push('=== OpenCode Session Hub — Debug Report ===');
   lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push('');
+
+  lines.push('-- Environment --');
+  lines.push(`OS: ${os.platform()} ${os.release()} (${os.arch()})`);
+  lines.push(`Node: ${process.version}`);
+  lines.push(`node:sqlite available: ${await hasNodeSqlite()}`);
+  lines.push(`git: ${await gitVersion()}`);
   lines.push('');
 
   lines.push('-- Settings --');
@@ -42,11 +54,21 @@ export async function buildDebugReport(
 
   lines.push('-- opencode.db on disk right now --');
   const dbStat = await statOrNull(locations.databasePath);
-  lines.push(
-    dbStat
-      ? `opencode.db: ${dbStat.size} bytes, last modified ${dbStat.mtime.toISOString()}`
-      : 'opencode.db: does not exist on this machine'
-  );
+  if (dbStat) {
+    const mb = dbStat.size / (1024 * 1024);
+    lines.push(`opencode.db: ${dbStat.size} bytes (${mb.toFixed(0)} MB), last modified ${dbStat.mtime.toISOString()}`);
+    if (mb > OVERSIZED_FILE_SKIP_MB) {
+      lines.push(
+        `  WARNING: this is over the ${OVERSIZED_FILE_SKIP_MB} MB sync limit and is being skipped on every ` +
+          'push (GitHub hard-rejects any single file over 100 MB, and hashing a file this size costs real time ' +
+          'and disk locally too). If this size is unexpected, run VACUUM on it while OpenCode is closed — a ' +
+          "database this large usually means bloat from deleted rows, not that much real history. If it's " +
+          "genuinely this large, session sync isn't practical for it as-is; leave includeSessions off."
+      );
+    }
+  } else {
+    lines.push('opencode.db: does not exist on this machine');
+  }
   const walStat = await statOrNull(`${locations.databasePath}-wal`);
   if (walStat && walStat.size > 0) {
     lines.push(
@@ -71,4 +93,27 @@ async function statOrNull(target: string): Promise<fs.Stats | null> {
   } catch {
     return null;
   }
+}
+
+async function hasNodeSqlite(): Promise<boolean> {
+  try {
+    require('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function gitVersion(): Promise<string> {
+  return new Promise((resolve) => {
+    let stdout = '';
+    try {
+      const child = spawn('git', ['--version']);
+      child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+      child.on('error', () => resolve('(git not found on PATH)'));
+      child.on('close', (code) => resolve(code === 0 ? stdout.trim() : '(git --version failed)'));
+    } catch {
+      resolve('(git not found on PATH)');
+    }
+  });
 }

@@ -447,4 +447,96 @@ describe('two-machine sync simulation', () => {
     assert.strictEqual(typeof status.ahead, 'number');
     assert.strictEqual(typeof status.behind, 'number');
   });
+
+  it('skips a database over the sync size limit instead of trying to push a file GitHub would reject', async () => {
+    // GitHub hard-rejects any single file over 100 MB; syncing one that big
+    // would also mean git spends real time hashing/compressing it locally
+    // first. Reproduces the real-world report: opencode.db grows unbounded
+    // and every sync either hangs or fails outright once it crosses that line.
+    const oversizedRemote = path.join(root, 'oversized-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', oversizedRemote]);
+
+    const bigMachine = createMachine(root, 'oversized-db');
+    const dbPath = path.join(bigMachine.dataRoot, 'opencode.db');
+    fs.writeFileSync(dbPath, Buffer.alloc(95 * 1024 * 1024, 1));
+
+    const outcome = await new SyncManager(
+      resolveOpenCodeLocations(bigMachine.env, 'linux'),
+      settingsFor(bigMachine, { remoteUrl: oversizedRemote })
+    ).push();
+
+    // Nothing else was configured to sync for this machine, so once the
+    // oversized db is skipped there's genuinely nothing left to commit —
+    // what matters is that it was skipped with a clear reason, not silently.
+    assert.notStrictEqual(outcome.status, 'error', outcome.messages.join(' | '));
+    assert.ok(
+      outcome.messages.some((m) => m.includes('opencode.db') && m.includes('exceeds') && m.includes('90 MB')),
+      outcome.messages.join(' | ')
+    );
+    assert.ok(
+      !fs.existsSync(path.join(bigMachine.home, 'sync-repo', 'data', 'opencode.db')),
+      'the oversized file must never reach the sync repo'
+    );
+  });
+
+  it('reports an oversized database in the debug report even before any sync has run', async () => {
+    const debugMachine = createMachine(root, 'oversized-debug');
+    fs.writeFileSync(path.join(debugMachine.dataRoot, 'opencode.db'), Buffer.alloc(95 * 1024 * 1024, 1));
+
+    const manager = new SyncManager(
+      resolveOpenCodeLocations(debugMachine.env, 'linux'),
+      settingsFor(debugMachine, { remoteUrl: path.join(root, 'unused-remote.git') })
+    );
+    const report = await manager.debugReport();
+    assert.ok(report.includes('Oversized files') && report.includes('opencode.db'), report);
+  });
+
+  it('recovers from a stale index.lock left behind by a killed git process', async () => {
+    const staleRemote = path.join(root, 'stale-lock-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', staleRemote]);
+
+    const machine = createMachine(root, 'stale-lock');
+    addStorageSession(machine, {
+      projectId: 'prj_stale',
+      sessionId: 'ses_stale',
+      title: 'Should still sync once unstuck',
+      worktree: '/stale/project',
+    });
+    const manager = new SyncManager(
+      resolveOpenCodeLocations(machine.env, 'linux'),
+      settingsFor(machine, { remoteUrl: staleRemote })
+    );
+
+    // Establish the repo, then simulate a crashed git process: a leftover
+    // index.lock with an old mtime, which real git never clears on its own.
+    await manager.ensureRepo();
+    const lockPath = path.join(machine.home, 'sync-repo', '.git', 'index.lock');
+    fs.writeFileSync(lockPath, '');
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const outcome = await manager.push();
+    assert.strictEqual(outcome.status, 'ok', outcome.messages.join(' | '));
+    assert.ok(!fs.existsSync(lockPath), 'stale lock should have been cleared');
+  });
+
+  it('leaves a fresh index.lock alone instead of racing a real concurrent git process', async () => {
+    const freshRemote = path.join(root, 'fresh-lock-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', freshRemote]);
+
+    const machine = createMachine(root, 'fresh-lock');
+    const manager = new SyncManager(
+      resolveOpenCodeLocations(machine.env, 'linux'),
+      settingsFor(machine, { remoteUrl: freshRemote })
+    );
+
+    await manager.ensureRepo();
+    const lockPath = path.join(machine.home, 'sync-repo', '.git', 'index.lock');
+    fs.writeFileSync(lockPath, ''); // freshly created — mtime is "now"
+
+    await assert.rejects(() => manager.push());
+    assert.ok(fs.existsSync(lockPath), 'a fresh lock must not be deleted out from under a real operation');
+
+    fs.rmSync(lockPath, { force: true }); // clean up so it doesn't affect later tests
+  });
 });
