@@ -289,6 +289,12 @@ describe('sidebar dashboard', () => {
     assert.ok(stub.messages.some((m) => m.kind === 'warn'));
   });
 
+  it('delegates the compact-database button to the command, same as Show Debug Info', async () => {
+    stub.executedCommands.length = 0;
+    await onMessage({ type: 'compactDatabase' });
+    assert.ok(stub.executedCommands.includes('opencodeSessionHub.compactDatabase'));
+  });
+
   it('surfaces a sync error to the state instead of throwing out of the handler', async () => {
     await onMessage({ type: 'saveConnection', remoteUrl: 'file:///definitely/not/a/repo', branch: 'main' });
     await onMessage({ type: 'push' });

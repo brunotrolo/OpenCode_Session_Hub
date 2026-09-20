@@ -31,6 +31,7 @@ type Inbound =
   | { type: 'deleteSession'; id: string }
   | { type: 'openFullList' }
   | { type: 'showDebugInfo' }
+  | { type: 'compactDatabase' }
   | { type: 'saveFavorite'; label: string; sessionId: string }
   | { type: 'removeFavorite'; id: string }
   | { type: 'previewFavorite'; sessionId: string }
@@ -134,6 +135,11 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
         case 'showDebugInfo':
           await vscode.commands.executeCommand('opencodeSessionHub.showDebugInfo');
+          return;
+
+        case 'compactDatabase':
+          await vscode.commands.executeCommand('opencodeSessionHub.compactDatabase');
+          this.postState();
           return;
 
         case 'saveFavorite':
@@ -330,6 +336,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     <button id="btn-pull">Pull Now</button>
     <button id="btn-refresh" class="secondary">Refresh</button>
     <button id="btn-debug" class="secondary">Show Debug Info</button>
+    <button id="btn-compact-db" class="secondary">Compact Database…</button>
   </div>
   <div id="conflict-row" class="row" style="display:none">
     <button id="btn-keep-local">Keep Local</button>
@@ -470,6 +477,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   $('btn-pull').addEventListener('click', () => vscode.postMessage({ type: 'pull' }));
   $('btn-refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
   $('btn-debug').addEventListener('click', () => vscode.postMessage({ type: 'showDebugInfo' }));
+  $('btn-compact-db').addEventListener('click', () => vscode.postMessage({ type: 'compactDatabase' }));
   $('btn-keep-local').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'local' }));
   $('btn-keep-remote').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'remote' }));
   $('btn-open-list').addEventListener('click', () => vscode.postMessage({ type: 'openFullList' }));

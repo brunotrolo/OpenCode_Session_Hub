@@ -27,6 +27,10 @@ synced between machines through your own private Git repository.
   any favorite pointing at it.
 - **Debug info** — see exactly what's really been synced when the status
   badge alone isn't enough.
+- **Compact Database** — shrinks `opencode.db` in place (`VACUUM`) when it's
+  grown too large to sync (over 90 MB is skipped automatically — see
+  TECHNICAL.md). Close OpenCode first, then run it from the sidebar or
+  **OpenCode Sync: Compact Database (VACUUM)**.
 
 See [TECHNICAL.md](TECHNICAL.md) for storage formats, sync internals, and
 safety guarantees.

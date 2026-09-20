@@ -48,6 +48,7 @@ export function activate(context: vscode.ExtensionContext) {
     await vscode.commands.executeCommand('workbench.view.extension.opencodeSessionHub');
   });
   register('opencodeSessionHub.showDebugInfo', () => showDebugInfo());
+  register('opencodeSessionHub.compactDatabase', () => compactDatabase());
 
   const config = vscode.workspace.getConfiguration('opencodeSessionHub');
   if (config.get<boolean>('autoPullOnStartup', true) && controller.getSettings().remoteUrl) {
@@ -151,6 +152,40 @@ async function showDebugInfo() {
   output.appendLine(report);
   output.show(true);
   vscode.window.showInformationMessage('OpenCode Session Hub debug info written to the Output panel.');
+}
+
+/**
+ * VACUUM needs SQLite to treat the connection as exclusive enough to rewrite
+ * the whole file, so this can't safely run while OpenCode has the database
+ * open and active — hence the modal warning rather than just doing it.
+ */
+async function compactDatabase() {
+  const databasePath = controller.getLocations().databasePath;
+  const choice = await vscode.window.showWarningMessage(
+    `Compact opencode.db (${databasePath})? Close OpenCode first — this rewrites the whole file and can take a ` +
+      "while for a large database. This only shrinks the file on disk; it doesn't sync anything by itself.",
+    { modal: true },
+    'Compact'
+  );
+  if (choice !== 'Compact') {
+    return;
+  }
+
+  const result = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'OpenCode: compacting opencode.db (VACUUM)' },
+    () => controller.compactDatabase()
+  );
+
+  if (!result.ok) {
+    vscode.window.showErrorMessage(`OpenCode Session Hub: ${result.error}`);
+    return;
+  }
+
+  const beforeMb = (result.beforeBytes / (1024 * 1024)).toFixed(0);
+  const afterMb = (result.afterBytes / (1024 * 1024)).toFixed(0);
+  vscode.window.showInformationMessage(
+    `opencode.db compacted: ${beforeMb} MB -> ${afterMb} MB. Run "Push Now" to sync the smaller database.`
+  );
 }
 
 async function showSyncStatus() {

@@ -63,7 +63,16 @@ Key safety properties, implemented in `syncManager.ts`:
   runs. `opencode-synced` solves the same problem more completely with a
   chunking scheme (`src/sync/chunks.ts`, files up to 4 GB); this is the
   narrower fix — surface the problem clearly and never make it worse,
-  without taking on chunking's complexity.
+  without taking on chunking's complexity. The other half of "never make it
+  worse" is giving the user a way back under the limit: **Compact Database**
+  (`dbMaintenance.ts`'s `vacuumDatabase`) runs SQLite's own `VACUUM` on
+  `opencode.db` in place. A multi-GB database is almost always freelist
+  bloat from deleted rows rather than that much real history, and VACUUM is
+  the standard tool for reclaiming it — this just means the user doesn't
+  need the separate `sqlite3` CLI installed to run it. It's local-only (a
+  sync still has to run afterward to publish the smaller file) and refuses
+  cleanly with a "close OpenCode and try again" message if the database is
+  locked, rather than corrupting anything.
 - **Stale `.git/index.lock` recovery** (`clearStaleIndexLock`,
   `STALE_INDEX_LOCK_AGE_MS` = 2 minutes): plain git leaves this lock behind
   forever if the process holding it is killed mid-operation (VS Code

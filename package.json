@@ -48,6 +48,10 @@
         "title": "OpenCode: Show Sync Debug Info"
       },
       {
+        "command": "opencodeSessionHub.compactDatabase",
+        "title": "OpenCode Sync: Compact Database (VACUUM)"
+      },
+      {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"
       },

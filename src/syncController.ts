@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { buildDebugReport } from './debugInfo';
+import { vacuumDatabase, VacuumResult } from './dbMaintenance';
 import { addFavorite, FavoriteSession, loadFavorites, removeFavorite, removeFavoritesBySessionId } from './favorites';
 import { OpenCodeLocations, resolveOpenCodeLocations } from './opencodePaths';
 import { DirectoryMapping } from './pathMapper';
@@ -205,5 +206,16 @@ export class SyncController {
     const locations = this.getLocations();
     const settings = this.getSettings();
     return buildDebugReport(locations, settings, new SyncManager(locations, settings));
+  }
+
+  /**
+   * Shrinks opencode.db via VACUUM — the fix for a database that's grown
+   * large enough to be skipped by the sync size limit (see
+   * OVERSIZED_FILE_SKIP_BYTES in syncManager.ts). Local-only: it doesn't
+   * touch the sync repo, so a sync still needs to run afterward to actually
+   * publish the smaller database.
+   */
+  async compactDatabase(): Promise<VacuumResult> {
+    return vacuumDatabase(this.getLocations().databasePath);
   }
 }

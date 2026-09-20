@@ -11,6 +11,8 @@ export interface StubState {
   statusBar: { text: string; tooltip: string; command: string };
   disposed: boolean;
   viewProviders: Map<string, unknown>;
+  /** Commands invoked via vscode.commands.executeCommand(...), in order. */
+  executedCommands: string[];
 }
 
 export function installVscodeStub(): StubState {
@@ -25,6 +27,7 @@ export function installVscodeStub(): StubState {
     messages: [],
     statusBar: { text: '', tooltip: '', command: '' },
     disposed: false,
+    executedCommands: [],
     viewProviders: new Map(),
   };
 
@@ -133,7 +136,10 @@ export function installVscodeStub(): StubState {
         state.commands.set(name, handler);
         return { dispose: () => state.commands.delete(name) };
       },
-      executeCommand: async () => undefined,
+      executeCommand: async (name: string) => {
+        state.executedCommands.push(name);
+        return undefined;
+      },
     },
   };
 
