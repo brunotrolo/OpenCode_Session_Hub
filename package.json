@@ -20,7 +20,29 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeSessionHub",
+          "title": "OpenCode Session Hub",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeSessionHub": [
+        {
+          "id": "opencodeSessionHub.dashboard",
+          "name": "Session Hub",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "opencodeSessionHub.openDashboard",
+        "title": "OpenCode: Open Session Hub Panel"
+      },
       {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"

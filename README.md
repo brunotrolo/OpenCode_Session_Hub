@@ -39,6 +39,13 @@ Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
 
 ## Features
 
+- **Sidebar control panel** — a dedicated Activity Bar icon opens the
+  "OpenCode Session Hub" view: connection (remote URL + branch), schedule
+  (debounce, auto-pull/auto-push toggles), the security fail-closed gate,
+  live sync health (status, ahead/behind, last sync, last error), and the
+  most recent sessions with one-click Preview/Resume — everything below,
+  without leaving the sidebar. Open it via the Activity Bar icon or
+  **OpenCode: Open Session Hub Panel**.
 - **Global session browser** (`OpenCode: List All Sessions`) — every session
   across every project, newest first. Resume in a terminal, preview, open the
   folder, or write a handoff.
@@ -172,8 +179,9 @@ if you need them:
 ```bash
 npm install
 npm run compile
-npm test        # 44 tests: storage scanning, sanitizer, path mapping,
-                # two-machine sync simulation, extension activation
+npm test        # 54 tests: storage scanning, sanitizer, path mapping,
+                # two-machine sync simulation, extension activation,
+                # sidebar dashboard message protocol
 ```
 
 Press `F5` in VS Code to launch an Extension Development Host.

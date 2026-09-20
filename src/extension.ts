@@ -1,45 +1,56 @@
-import * as path from 'path';
 import * as vscode from 'vscode';
+import { DashboardViewProvider } from './dashboardView';
 import { generateHandoff } from './handoff';
-import { OpenCodeLocations, resolveOpenCodeLocations } from './opencodePaths';
-import { DirectoryMapping, resolveLocalDirectory } from './pathMapper';
+import { OpenCodeLocations } from './opencodePaths';
+import { resolveLocalDirectory } from './pathMapper';
 import { showSessionPreview } from './previewPanel';
-import { loadMessages, scanSessions, SessionRecord } from './sessionScanner';
+import { loadMessages, SessionRecord } from './sessionScanner';
 import { SyncStatusBar } from './statusBar';
-import { SyncError, SyncManager, SyncOutcome, SyncSettings, SyncStatus } from './syncManager';
+import { SyncController } from './syncController';
+import { SyncError, SyncOutcome } from './syncManager';
 
-let debounceTimer: NodeJS.Timeout | undefined;
 let statusBar: SyncStatusBar;
 let output: vscode.OutputChannel;
+let controller: SyncController;
 
 export function activate(context: vscode.ExtensionContext) {
   output = vscode.window.createOutputChannel('OpenCode Session Hub');
-  statusBar = new SyncStatusBar(readSettings(context).remoteUrl ? 'idle' : 'unconfigured');
-  context.subscriptions.push(output, statusBar);
+  controller = new SyncController(context, output);
+  statusBar = new SyncStatusBar(controller.getState().status);
+  context.subscriptions.push(output, statusBar, { dispose: () => controller.dispose() });
+  context.subscriptions.push(controller.onDidChangeState((state) => statusBar.set(state.status)));
+
+  const dashboard = new DashboardViewProvider(context, controller);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(DashboardViewProvider.viewType, dashboard)
+  );
 
   const register = (name: string, handler: (...args: unknown[]) => unknown) =>
     context.subscriptions.push(vscode.commands.registerCommand(name, handler));
 
-  register('opencodeSessionHub.listAllSessions', () => listAllSessions(context));
+  register('opencodeSessionHub.listAllSessions', () => listAllSessions());
   register('opencodeSessionHub.previewSession', async () => {
-    const locations = getLocations();
-    const record = await pickSession(locations, 'Select a session to preview');
+    const locations = controller.getLocations();
+    const record = await pickSession('Select a session to preview');
     if (record) {
       showSessionPreview(locations, record);
     }
   });
   register('opencodeSessionHub.searchSessions', () => searchSessions());
-  register('opencodeSessionHub.syncInit', () => initOrLink(context, 'init'));
-  register('opencodeSessionHub.syncLink', () => initOrLink(context, 'link'));
-  register('opencodeSessionHub.syncPush', () => runSync(context, 'push'));
-  register('opencodeSessionHub.syncPull', () => runSync(context, 'pull'));
-  register('opencodeSessionHub.syncStatus', () => showSyncStatus(context));
-  register('opencodeSessionHub.syncResolve', () => resolveConflicts(context));
-  register('opencodeSessionHub.generateHandoff', () => generateHandoffCommand(context));
+  register('opencodeSessionHub.syncInit', () => initOrLink('init'));
+  register('opencodeSessionHub.syncLink', () => initOrLink('link'));
+  register('opencodeSessionHub.syncPush', () => runSync('push'));
+  register('opencodeSessionHub.syncPull', () => runSync('pull'));
+  register('opencodeSessionHub.syncStatus', () => showSyncStatus());
+  register('opencodeSessionHub.syncResolve', () => resolveConflicts());
+  register('opencodeSessionHub.generateHandoff', () => generateHandoffCommand());
+  register('opencodeSessionHub.openDashboard', async () => {
+    await vscode.commands.executeCommand('workbench.view.extension.opencodeSessionHub');
+  });
 
   const config = vscode.workspace.getConfiguration('opencodeSessionHub');
-  if (config.get<boolean>('autoPullOnStartup', true) && readSettings(context).remoteUrl) {
-    void runSync(context, 'pull', { silent: true });
+  if (config.get<boolean>('autoPullOnStartup', true) && controller.getSettings().remoteUrl) {
+    void runSync('pull', { silent: true });
   }
 
   context.subscriptions.push(
@@ -48,104 +59,31 @@ export function activate(context: vscode.ExtensionContext) {
       if (state.focused || !settings.get<boolean>('autoSyncOnFocusLost', true)) {
         return;
       }
-      if (!readSettings(context).remoteUrl) {
+      if (!controller.getSettings().remoteUrl) {
         return;
       }
-      scheduleDebouncedPush(context, settings.get<number>('debounceSeconds', 20));
+      controller.scheduleDebouncedPush(settings.get<number>('debounceSeconds', 20));
     })
   );
-
-  context.subscriptions.push({
-    dispose: () => {
-      if (debounceTimer) {
-        clearTimeout(debounceTimer);
-        debounceTimer = undefined;
-      }
-    },
-  });
 }
 
 export function deactivate() {
-  if (debounceTimer) {
-    clearTimeout(debounceTimer);
-    debounceTimer = undefined;
-  }
-}
-
-// ------------------------------------------------------------- settings ---
-
-function getLocations(): OpenCodeLocations {
-  const override = vscode.workspace
-    .getConfiguration('opencodeSessionHub')
-    .get<string>('dataPath', '')
-    .trim();
-  return resolveOpenCodeLocations(process.env, process.platform, override || undefined);
-}
-
-function readSettings(context: vscode.ExtensionContext): SyncSettings {
-  const config = vscode.workspace.getConfiguration('opencodeSessionHub');
-  const repoDir = config.get<string>('syncRepoPath', '').trim();
-
-  return {
-    remoteUrl: config.get<string>('syncRemoteUrl', '').trim(),
-    branch: config.get<string>('syncBranch', 'main').trim() || 'main',
-    repoDir: repoDir || path.join(context.globalStorageUri.fsPath, 'sync-repo'),
-    includeSecrets: config.get<boolean>('includeSecrets', false),
-    includeSessions: config.get<boolean>('includeSessions', true),
-    includeModelFavorites: config.get<boolean>('includeModelFavorites', true),
-    includeOpencodeSkills: config.get<boolean>('includeOpencodeSkills', true),
-    includeAgentsDir: config.get<boolean>('includeAgentsDir', true),
-    redactSecrets: config.get<boolean>('redactSecrets', true),
-    privateRepoAcknowledged: config.get<boolean>('privateRepoAcknowledged', false),
-  };
-}
-
-function getMappings(): DirectoryMapping[] {
-  const raw = vscode.workspace
-    .getConfiguration('opencodeSessionHub')
-    .get<DirectoryMapping[]>('directoryMappings', []);
-  return raw.filter((entry) => entry && typeof entry.from === 'string' && typeof entry.to === 'string');
+  controller?.dispose();
 }
 
 // ---------------------------------------------------------------- sync ----
 
-function scheduleDebouncedPush(context: vscode.ExtensionContext, seconds: number) {
-  if (debounceTimer) {
-    clearTimeout(debounceTimer);
-  }
-  debounceTimer = setTimeout(() => {
-    debounceTimer = undefined;
-    void runSync(context, 'push', { silent: true });
-  }, Math.max(1, seconds) * 1000);
-}
-
-async function runSync(
-  context: vscode.ExtensionContext,
-  direction: 'push' | 'pull',
-  options: { silent?: boolean } = {}
-): Promise<void> {
-  const settings = readSettings(context);
-  if (!settings.remoteUrl) {
-    setStatus('unconfigured');
-    if (!options.silent) {
-      vscode.window.showWarningMessage('Set opencodeSessionHub.syncRemoteUrl first, or run "OpenCode Sync: Initialize Sync Repository".');
-    }
-    return;
-  }
-
-  const manager = new SyncManager(getLocations(), settings);
-  setStatus('syncing');
-
+async function runSync(direction: 'push' | 'pull', options: { silent?: boolean } = {}): Promise<void> {
   try {
     const outcome = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: `OpenCode sync: ${direction}` },
-      () => (direction === 'push' ? manager.push() : manager.pull())
+      () => controller.sync(direction, options)
     );
-    reportOutcome(direction, outcome, options.silent === true);
+    if (outcome) {
+      reportOutcome(direction, outcome, options.silent === true);
+    }
   } catch (err) {
-    setStatus('error');
     const message = err instanceof SyncError ? err.message : String(err);
-    output.appendLine(`[${new Date().toISOString()}] ${direction} failed: ${message}`);
     if (!options.silent) {
       vscode.window.showErrorMessage(`OpenCode sync ${direction} failed: ${message}`);
     }
@@ -153,17 +91,11 @@ async function runSync(
 }
 
 function reportOutcome(direction: string, outcome: SyncOutcome, silent: boolean) {
-  for (const message of outcome.messages) {
-    output.appendLine(`[${new Date().toISOString()}] ${message}`);
-  }
-
   if (outcome.status === 'conflict') {
-    setStatus('conflict');
     vscode.window.showWarningMessage(outcome.messages.join(' ') || 'OpenCode sync hit a conflict.');
     return;
   }
 
-  setStatus('idle');
   // Fail-closed notices must reach the user even on a silent background sync:
   // silently not syncing sessions is exactly the surprise worth avoiding.
   const important = outcome.messages.filter((m) => m.includes('NOT synced') || m.startsWith('Skipped'));
@@ -178,12 +110,8 @@ function reportOutcome(direction: string, outcome: SyncOutcome, silent: boolean)
   }
 }
 
-function setStatus(status: SyncStatus) {
-  statusBar?.set(status);
-}
-
-async function initOrLink(context: vscode.ExtensionContext, mode: 'init' | 'link') {
-  const current = readSettings(context);
+async function initOrLink(mode: 'init' | 'link') {
+  const current = controller.getSettings();
   const url = await vscode.window.showInputBox({
     prompt:
       mode === 'init'
@@ -198,35 +126,40 @@ async function initOrLink(context: vscode.ExtensionContext, mode: 'init' | 'link
     return;
   }
 
-  await vscode.workspace
-    .getConfiguration('opencodeSessionHub')
-    .update('syncRemoteUrl', url.trim(), vscode.ConfigurationTarget.Global);
-
-  // Linking adopts the remote's state; initializing publishes this machine's.
-  await runSync(context, mode === 'link' ? 'pull' : 'push');
+  try {
+    const outcome = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: `OpenCode sync: ${mode}` },
+      () => controller.initOrLink(url, mode)
+    );
+    if (outcome) {
+      reportOutcome(mode === 'link' ? 'pull' : 'push', outcome, false);
+    }
+  } catch (err) {
+    const message = err instanceof SyncError ? err.message : String(err);
+    vscode.window.showErrorMessage(`OpenCode sync ${mode} failed: ${message}`);
+  }
 }
 
-async function showSyncStatus(context: vscode.ExtensionContext) {
-  const settings = readSettings(context);
-  if (!settings.remoteUrl) {
+async function showSyncStatus() {
+  if (!controller.getSettings().remoteUrl) {
     vscode.window.showWarningMessage('OpenCode sync is not configured.');
     return;
   }
 
-  try {
-    const status = await new SyncManager(getLocations(), settings).status();
-    vscode.window.showInformationMessage(
-      `OpenCode sync [${status.branch}] — ${status.ahead} ahead, ${status.behind} behind` +
-        `${status.dirty ? ', local changes pending' : ''}${status.conflicted ? ', CONFLICTED' : ''}`
-    );
-    setStatus(status.conflicted ? 'conflict' : 'idle');
-  } catch (err) {
-    setStatus('error');
-    vscode.window.showErrorMessage(`Could not read sync status: ${err instanceof Error ? err.message : String(err)}`);
+  const status = await controller.refreshStatus();
+  if (!status) {
+    const state = controller.getState();
+    vscode.window.showErrorMessage(`Could not read sync status: ${state.lastError ?? 'unknown error'}`);
+    return;
   }
+
+  vscode.window.showInformationMessage(
+    `OpenCode sync [${status.branch}] — ${status.ahead} ahead, ${status.behind} behind` +
+      `${status.dirty ? ', local changes pending' : ''}${status.conflicted ? ', CONFLICTED' : ''}`
+  );
 }
 
-async function resolveConflicts(context: vscode.ExtensionContext) {
+async function resolveConflicts() {
   const choice = await vscode.window.showQuickPick(
     [
       { label: 'Keep this machine’s version', keep: 'local' as const },
@@ -239,26 +172,25 @@ async function resolveConflicts(context: vscode.ExtensionContext) {
   }
 
   try {
-    const outcome = await new SyncManager(getLocations(), readSettings(context)).resolveConflicts(choice.keep);
+    const outcome = await controller.resolveConflicts(choice.keep);
     vscode.window.showInformationMessage(outcome.messages.join(' '));
-    setStatus('idle');
   } catch (err) {
-    setStatus('error');
-    vscode.window.showErrorMessage(`Could not resolve conflicts: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof SyncError ? err.message : String(err);
+    vscode.window.showErrorMessage(`Could not resolve conflicts: ${message}`);
   }
 }
 
 // ------------------------------------------------------------ sessions ----
 
-async function listAllSessions(context: vscode.ExtensionContext) {
-  const locations = getLocations();
-  const record = await pickSession(locations, 'Select an OpenCode session from any project on this machine');
+async function listAllSessions() {
+  const locations = controller.getLocations();
+  const record = await pickSession('Select an OpenCode session from any project on this machine');
   if (!record) {
     return;
   }
 
   const localDir = resolveLocalDirectory(record.directory, {
-    mappings: getMappings(),
+    mappings: controller.getMappings(),
     workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
     searchRoots: vscode.workspace.getConfiguration('opencodeSessionHub').get<string[]>('projectSearchRoots', []),
   });
@@ -274,21 +206,16 @@ async function listAllSessions(context: vscode.ExtensionContext) {
     } else if (choice === 'Pick Folder…') {
       const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false });
       if (picked?.[0]) {
-        await offerSessionActions(locations, record, picked[0].fsPath, context);
+        await offerSessionActions(locations, record, picked[0].fsPath);
       }
     }
     return;
   }
 
-  await offerSessionActions(locations, record, localDir, context);
+  await offerSessionActions(locations, record, localDir);
 }
 
-async function offerSessionActions(
-  locations: OpenCodeLocations,
-  record: SessionRecord,
-  directory: string,
-  context: vscode.ExtensionContext
-) {
+async function offerSessionActions(locations: OpenCodeLocations, record: SessionRecord, directory: string) {
   const action = await vscode.window.showQuickPick(
     [
       { label: '$(terminal) Resume in Terminal', action: 'terminal' as const },
@@ -312,7 +239,7 @@ async function offerSessionActions(
       });
       break;
     case 'handoff':
-      writeHandoff(locations, record, directory, context);
+      writeHandoff(locations, record, directory);
       break;
     default:
       break;
@@ -327,9 +254,9 @@ function openInTerminal(record: SessionRecord, directory: string) {
   terminal.sendText(`opencode --session ${record.id}`);
 }
 
-async function generateHandoffCommand(context: vscode.ExtensionContext) {
-  const locations = getLocations();
-  const record = await pickSession(locations, 'Select a session to checkpoint');
+async function generateHandoffCommand() {
+  const locations = controller.getLocations();
+  const record = await pickSession('Select a session to checkpoint');
   if (!record) {
     return;
   }
@@ -339,20 +266,15 @@ async function generateHandoffCommand(context: vscode.ExtensionContext) {
     vscode.window.showWarningMessage('Open a workspace folder to write a handoff checkpoint.');
     return;
   }
-  writeHandoff(locations, record, workspaceRoot, context);
+  writeHandoff(locations, record, workspaceRoot);
 }
 
-function writeHandoff(
-  locations: OpenCodeLocations,
-  record: SessionRecord,
-  workspaceRoot: string,
-  context: vscode.ExtensionContext
-) {
+function writeHandoff(locations: OpenCodeLocations, record: SessionRecord, workspaceRoot: string) {
   try {
     const filePath = generateHandoff(locations, record, workspaceRoot);
     vscode.window.showInformationMessage(`Handoff written to ${filePath}`);
-    if (readSettings(context).remoteUrl) {
-      scheduleDebouncedPush(context, vscode.workspace.getConfiguration('opencodeSessionHub').get<number>('debounceSeconds', 20));
+    if (controller.getSettings().remoteUrl) {
+      controller.scheduleDebouncedPush(vscode.workspace.getConfiguration('opencodeSessionHub').get<number>('debounceSeconds', 20));
     }
   } catch (err) {
     vscode.window.showErrorMessage(`Could not write handoff: ${err instanceof Error ? err.message : String(err)}`);
@@ -368,14 +290,14 @@ async function searchSessions() {
     return;
   }
 
-  const locations = getLocations();
+  const locations = controller.getLocations();
   const needle = query.toLowerCase();
 
   const matches = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: 'Searching OpenCode history…' },
     async () => {
       const found: { record: SessionRecord; snippet: string }[] = [];
-      for (const record of scanSessions(locations).sessions) {
+      for (const record of controller.listSessions().sessions) {
         for (const message of loadMessages(locations, record)) {
           const index = message.text.toLowerCase().indexOf(needle);
           if (index >= 0) {
@@ -411,8 +333,8 @@ async function searchSessions() {
   }
 }
 
-async function pickSession(locations: OpenCodeLocations, placeHolder: string): Promise<SessionRecord | undefined> {
-  const { sessions, warnings } = scanSessions(locations);
+async function pickSession(placeHolder: string): Promise<SessionRecord | undefined> {
+  const { sessions, warnings } = controller.listSessions();
   for (const warning of warnings) {
     output.appendLine(`[${new Date().toISOString()}] ${warning}`);
     vscode.window.showWarningMessage(warning);
@@ -420,7 +342,7 @@ async function pickSession(locations: OpenCodeLocations, placeHolder: string): P
 
   if (sessions.length === 0) {
     vscode.window.showInformationMessage(
-      `No OpenCode sessions found under ${locations.dataRoot}. Set opencodeSessionHub.dataPath if OpenCode stores data elsewhere.`
+      `No OpenCode sessions found under ${controller.getLocations().dataRoot}. Set opencodeSessionHub.dataPath if OpenCode stores data elsewhere.`
     );
     return undefined;
   }

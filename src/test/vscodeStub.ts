@@ -8,6 +8,7 @@ export interface StubState {
   messages: { kind: 'info' | 'warn' | 'error'; text: string }[];
   statusBar: { text: string; tooltip: string; command: string };
   disposed: boolean;
+  viewProviders: Map<string, unknown>;
 }
 
 export function installVscodeStub(): StubState {
@@ -21,13 +22,31 @@ export function installVscodeStub(): StubState {
     messages: [],
     statusBar: { text: '', tooltip: '', command: '' },
     disposed: false,
+    viewProviders: new Map(),
   };
+
+  class EventEmitter<T> {
+    private listeners: ((value: T) => void)[] = [];
+    event = (listener: (value: T) => void) => {
+      this.listeners.push(listener);
+      return { dispose: () => undefined };
+    };
+    fire(value: T) {
+      for (const listener of this.listeners) {
+        listener(value);
+      }
+    }
+    dispose() {
+      this.listeners = [];
+    }
+  }
 
   const vscode = {
     ConfigurationTarget: { Global: 1, Workspace: 2 },
     StatusBarAlignment: { Left: 1, Right: 2 },
     ViewColumn: { Beside: -2 },
     ProgressLocation: { Window: 10, Notification: 15 },
+    EventEmitter,
     Uri: { file: (p: string) => ({ fsPath: p, scheme: 'file' }) },
     workspace: {
       workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
@@ -100,6 +119,10 @@ export function installVscodeStub(): StubState {
       },
       withProgress: async (_options: unknown, task: () => Promise<unknown>) => task(),
       onDidChangeWindowState: () => ({ dispose: () => undefined }),
+      registerWebviewViewProvider: (viewType: string, provider: unknown) => {
+        state.viewProviders.set(viewType, provider);
+        return { dispose: () => state.viewProviders.delete(viewType) };
+      },
     },
     commands: {
       registerCommand: (name: string, handler: (...args: unknown[]) => unknown) => {

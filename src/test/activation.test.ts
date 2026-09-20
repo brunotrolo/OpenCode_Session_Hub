@@ -130,7 +130,7 @@ describe('extension activation and commands', () => {
   it('refuses to sync before a remote is configured instead of throwing', async () => {
     stub.messages.length = 0;
     await stub.commands.get('opencodeSessionHub.syncPush')!();
-    assert.ok(stub.messages.some((m) => m.kind === 'warn' && m.text.includes('syncRemoteUrl')));
+    assert.ok(stub.messages.some((m) => m.kind === 'warn' && m.text.includes('sync repository URL')));
   });
 
   it('cancels cleanly when the user dismisses the session picker', async () => {
