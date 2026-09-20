@@ -78,6 +78,14 @@ Paths follow XDG (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `opencode_config_dir`) on
 - **Handoff checkpoints** — a Markdown summary at `.opencode/HANDOFF.md`.
 - **Full-text search** across every session's messages.
 - **Status bar indicator** — synced / syncing / conflict / error / unconfigured.
+- **Debug info** — `OpenCode: Show Sync Debug Info` (also a button in the
+  panel's Health section) dumps the facts a status badge can't show: real
+  `opencode.db`/`-wal` size and mtime on disk, whether session sync is
+  actually enabled, the sync repo's HEAD commit, and — the direct answer to
+  "is my live session really backed up" — the timestamp of the **last
+  commit that actually touched `data/opencode.db`** in the sync repo. A
+  green "Synced" badge only means the last sync *attempt* didn't error; it
+  does not mean every file was included in it.
 
 ## What gets synced
 
@@ -95,9 +103,19 @@ Mirrors the upstream plugin's item set, so a repo stays compatible both ways:
 
 Safety rules that apply on every sync:
 
-- `-wal`, `-shm`, `.lock` and `.tmp` files are never committed, and a database
-  with uncheckpointed WAL writes is skipped with a warning instead of being
-  copied mid-write.
+- `-wal`, `-shm`, `.lock` and `.tmp` files are never committed. Before
+  syncing `opencode.db`, a **PASSIVE SQLite checkpoint** is attempted first —
+  safe and non-blocking, it doesn't require OpenCode to be closed. If that
+  checkpoint fully drains the WAL (nothing was busy), the `.db` file alone
+  is already a complete, consistent snapshot and syncs normally, even while
+  OpenCode is actively running. Only a database with a *currently* active
+  writer or a pinned reader — the checkpoint genuinely couldn't finish — is
+  skipped with a warning, rather than copied mid-write. (Earlier versions
+  skipped the db whenever any `-wal` file merely existed, which during an
+  active session is nearly always — meaning a live database could go
+  effectively unsynced indefinitely while the panel still read "Synced".
+  Use **Show Sync Debug Info** to check when `opencode.db` was actually
+  last committed if you want to confirm this yourself.)
 - Session directories **merge** rather than mirror — files missing locally are
   never deleted from the repo, so one machine can't wipe the other's history.
 - A local file edited since this machine's last successful pull is never
@@ -188,7 +206,7 @@ if you need them:
 ```bash
 npm install
 npm run compile
-npm test        # 71 tests: storage scanning, sanitizer, path mapping,
+npm test        # 72 tests: storage scanning, sanitizer, path mapping,
                 # two-machine sync simulation, extension activation,
                 # sidebar dashboard message protocol, favorite sessions
 ```

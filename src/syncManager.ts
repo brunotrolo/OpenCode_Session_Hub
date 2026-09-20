@@ -231,6 +231,43 @@ export class SyncManager {
     };
   }
 
+  /**
+   * Repository-side facts for the debug report: what's actually in the
+   * mirror right now, as opposed to what the panel's summary status implies.
+   * In particular, "when was data/opencode.db last actually committed" is
+   * the direct answer to "is my live session really backed up on GitHub,
+   * or has it been silently skipped every time."
+   */
+  async debugReport(): Promise<string> {
+    const lines: string[] = [];
+    const repoExists = await exists(path.join(this.repoDir, '.git'));
+
+    lines.push(`Repo dir: ${this.repoDir}`);
+    lines.push(`Remote: ${this.settings.remoteUrl || '(not set)'}`);
+    lines.push(`Branch: ${this.settings.branch}`);
+
+    if (!repoExists) {
+      lines.push('Local mirror has not been created yet (no push/pull has run).');
+      return lines.join('\n');
+    }
+
+    const head = await this.git(['log', '-1', '--format=%H %cI %s'], { allowFailure: true });
+    lines.push(`HEAD commit: ${head.code === 0 && head.stdout.trim() ? head.stdout.trim() : '(no commits yet)'}`);
+
+    const dbRepoPath = 'data/opencode.db';
+    const dbLog = await this.git(['log', '-1', '--format=%cI  %s', '--', dbRepoPath], { allowFailure: true });
+    lines.push(
+      `Last commit touching ${dbRepoPath}: ${dbLog.stdout.trim() || '(never committed — either includeSecrets/privateRepoAcknowledged is off, or every sync so far skipped it)'}`
+    );
+
+    const lastPullAt = await this.readLastPullAt();
+    lines.push(
+      `Last successful pull completed on this machine: ${lastPullAt ? new Date(lastPullAt).toISOString() : '(never)'}`
+    );
+
+    return lines.join('\n');
+  }
+
   // --------------------------------------------------------------- mirror ---
 
   private async mirrorToRepo(items: SyncItem[]): Promise<string[]> {
@@ -409,7 +446,25 @@ export class SyncManager {
     }
   }
 
-  /** A database with a non-empty -wal beside it has uncheckpointed writes. */
+  /**
+   * A non-empty -wal beside the database means SQLite has content that
+   * hasn't been merged into the main file yet. SQLite's WAL mode means that
+   * during an active OpenCode session the WAL is *continuously* non-empty —
+   * OpenCode only checkpoints it back into the main file on a clean exit —
+   * so treating "WAL file exists" alone as the signal would skip
+   * opencode.db on essentially every sync while actively using it, even
+   * though "Synced" is what the panel would still report (nothing else
+   * changed to commit).
+   *
+   * A PASSIVE checkpoint is the fix, but its own success has to be judged
+   * from what it reports back (`busy`/`checkpointed`/`log`), not from the
+   * WAL file's size afterward — PASSIVE merges committed frames into the
+   * main file but does not necessarily shrink the WAL file itself (only
+   * TRUNCATE mode does, and that can block). Once every frame is
+   * checkpointed and nothing was busy, the main .db file alone is already
+   * a complete, consistent snapshot; a leftover WAL file at that point is
+   * just reusable space SQLite hasn't cleared yet, not missing data.
+   */
   private async isVolatile(filePath: string): Promise<boolean> {
     if (isVolatileName(filePath)) {
       return true;
@@ -417,8 +472,13 @@ export class SyncManager {
     if (!filePath.endsWith('.db')) {
       return false;
     }
+
     const wal = await statOrNull(`${filePath}-wal`);
-    return wal !== null && wal.size > 0;
+    if (!wal || wal.size === 0) {
+      return false;
+    }
+
+    return !(await tryCheckpointDatabase(filePath));
   }
 
   private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<GitResult> {
@@ -448,6 +508,51 @@ const MTIME_SAFETY_MARGIN_MS = 2000;
 
 function isVolatileName(name: string): boolean {
   return VOLATILE_SUFFIXES.some((suffix) => name.endsWith(suffix));
+}
+
+/**
+ * Best-effort, non-blocking WAL checkpoint. PASSIVE never waits for or
+ * interrupts a concurrent writer — at worst it checkpoints zero frames if
+ * OpenCode is writing at that exact instant, which is safe and exactly what
+ * "best-effort" means here. Returns whether every frame actually got
+ * checkpointed (`busy = 0` and `checkpointed === log`), which is the only
+ * way to know the main .db file is a complete, consistent snapshot on its
+ * own — WAL file *size* doesn't tell you that, since PASSIVE doesn't shrink
+ * it. Returns false without throwing on Node < 22.5 (no node:sqlite) or if
+ * the file can't be opened for any other reason; the caller then falls back
+ * to skipping, same as before this existed.
+ */
+async function tryCheckpointDatabase(databasePath: string): Promise<boolean> {
+  let DatabaseSync: new (
+    p: string,
+    o?: Record<string, unknown>
+  ) => { prepare(sql: string): { get(): Record<string, unknown> | undefined }; close(): void };
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return false;
+  }
+
+  try {
+    const db = new DatabaseSync(databasePath);
+    try {
+      const row = db.prepare('PRAGMA wal_checkpoint(PASSIVE);').get();
+      if (!row) {
+        return false;
+      }
+      const busy = Number(row.busy);
+      const log = Number(row.log);
+      const checkpointed = Number(row.checkpointed);
+      return busy === 0 && Number.isFinite(log) && checkpointed === log;
+    } finally {
+      db.close();
+    }
+  } catch {
+    // A concurrent writer holding a lock, or any other reason the
+    // checkpoint attempt failed — treat it as not fully checkpointed.
+    return false;
+  }
 }
 
 async function exists(target: string): Promise<boolean> {

@@ -29,6 +29,7 @@ type Inbound =
   | { type: 'previewSession'; id: string }
   | { type: 'resumeSession'; id: string }
   | { type: 'openFullList' }
+  | { type: 'showDebugInfo' }
   | { type: 'saveFavorite'; label: string; sessionId: string }
   | { type: 'removeFavorite'; id: string }
   | { type: 'previewFavorite'; sessionId: string }
@@ -124,6 +125,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
         case 'openFullList':
           await vscode.commands.executeCommand('opencodeSessionHub.listAllSessions');
+          return;
+
+        case 'showDebugInfo':
+          await vscode.commands.executeCommand('opencodeSessionHub.showDebugInfo');
           return;
 
         case 'saveFavorite':
@@ -293,6 +298,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     <button id="btn-push">Push Now</button>
     <button id="btn-pull">Pull Now</button>
     <button id="btn-refresh" class="secondary">Refresh</button>
+    <button id="btn-debug" class="secondary">Show Debug Info</button>
   </div>
   <div id="conflict-row" class="row" style="display:none">
     <button id="btn-keep-local">Keep Local</button>
@@ -359,7 +365,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       (state.lastSyncAt ? '<div class="health-line">Last sync: ' + new Date(state.lastSyncAt).toLocaleString() + '</div>' : '') +
       (state.lastError ? '<div class="health-line" style="color:var(--vscode-errorForeground)">' + escapeHtml(state.lastError) + '</div>' : '') +
       (state.lastOutcome && state.lastOutcome.messages.length
-        ? '<div class="health-line">' + state.lastOutcome.messages.map(escapeHtml).join('<br/>') + '</div>' : '') +
+        ? state.lastOutcome.messages.map((m) =>
+            '<div class="health-line"' +
+            (m.includes('Skipped') || m.includes('NOT synced') ? ' style="color:var(--vscode-errorForeground)"' : '') +
+            '>' + escapeHtml(m) + '</div>').join('') : '') +
       (warnings || []).map((w) => '<div class="health-line" style="color:var(--vscode-errorForeground)">' + escapeHtml(w) + '</div>').join('');
 
     $('conflict-row').style.display = state.status === 'conflict' ? 'flex' : 'none';
@@ -427,6 +436,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   $('btn-push').addEventListener('click', () => vscode.postMessage({ type: 'push' }));
   $('btn-pull').addEventListener('click', () => vscode.postMessage({ type: 'pull' }));
   $('btn-refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
+  $('btn-debug').addEventListener('click', () => vscode.postMessage({ type: 'showDebugInfo' }));
   $('btn-keep-local').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'local' }));
   $('btn-keep-remote').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'remote' }));
   $('btn-open-list').addEventListener('click', () => vscode.postMessage({ type: 'openFullList' }));

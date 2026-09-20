@@ -140,15 +140,64 @@ describe('two-machine sync simulation', () => {
     assert.ok(!fs.existsSync(ownSession), 'session data reached the repo despite failing closed');
   });
 
-  it('skips a database with uncheckpointed WAL writes instead of corrupting it', async () => {
-    const walMachine = createMachine(root, 'wal');
-    fs.writeFileSync(path.join(walMachine.dataRoot, 'opencode.db'), 'SQLite format 3\0');
-    fs.writeFileSync(path.join(walMachine.dataRoot, 'opencode.db-wal'), 'pending writes');
+  it('skips a database a passive checkpoint cannot fully drain', async () => {
+    // A small, uncommitted write transaction turns out not to reproduce this:
+    // SQLite typically keeps such a tiny change in its in-memory page cache
+    // and never even writes WAL frames for it until COMMIT, so there is
+    // nothing on disk yet for another connection's checkpoint to be blocked
+    // by. The real way a PASSIVE checkpoint stays unable to fully drain the
+    // WAL is a *reader* pinned to an older snapshot: SQLite won't overwrite
+    // frames a live reader still needs, so a checkpoint taken while that
+    // snapshot is open is necessarily partial.
+    const walMachine = createMachine(root, 'wal-pinned-reader');
+    const dbPath = path.join(walMachine.dataRoot, 'opencode.db');
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const writer = new DatabaseSync(dbPath);
+    writer.exec('PRAGMA journal_mode=WAL;');
+    writer.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);');
+    writer.exec("INSERT INTO t (v) VALUES ('one');");
+
+    const reader = new DatabaseSync(dbPath);
+    reader.exec('BEGIN;');
+    reader.prepare('SELECT * FROM t').all(); // establishes the snapshot
+
+    writer.exec("INSERT INTO t (v) VALUES ('two');"); // a frame the reader's snapshot excludes
+
+    try {
+      const outcome = await managerFor(walMachine).push();
+      assert.ok(outcome.messages.some((m) => m.includes('opencode.db')), outcome.messages.join(' | '));
+      assert.ok(!fs.existsSync(path.join(walMachine.home, 'sync-repo', 'data', 'opencode.db')));
+    } finally {
+      reader.exec('ROLLBACK;');
+      reader.close();
+      writer.close();
+    }
+  });
+
+  it('a PASSIVE checkpoint syncs the database once the writer goes idle between writes', async () => {
+    // This is the actual bug report this fix addresses: during a real
+    // session, OpenCode isn't writing every single millisecond — it pauses
+    // between messages. A sync landing in one of those gaps should capture
+    // real progress instead of skipping the db on every attempt.
+    const walMachine = createMachine(root, 'wal-idle-writer');
+    const dbPath = path.join(walMachine.dataRoot, 'opencode.db');
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const writer = new DatabaseSync(dbPath);
+    writer.exec('PRAGMA journal_mode=WAL;');
+    writer.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);');
+    writer.exec("INSERT INTO t (v) VALUES ('committed');");
+    // Committed and idle — no open transaction, matching the gap between
+    // two messages in an active chat session.
 
     const outcome = await managerFor(walMachine).push();
-    assert.ok(outcome.messages.some((m) => m.includes('opencode.db')));
-    assert.ok(!fs.existsSync(path.join(walMachine.home, 'sync-repo', 'data', 'opencode.db')));
-    assert.ok(!fs.existsSync(path.join(walMachine.home, 'sync-repo', 'data', 'opencode.db-wal')));
+    writer.close();
+
+    assert.ok(!outcome.messages.some((m) => m.includes('opencode.db')), outcome.messages.join(' | '));
+    assert.ok(fs.existsSync(path.join(walMachine.home, 'sync-repo', 'data', 'opencode.db')));
   });
 
   it('merges sessions from both machines instead of deleting the other side', async () => {

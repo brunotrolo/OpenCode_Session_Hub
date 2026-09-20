@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { buildDebugReport } from './debugInfo';
 import { addFavorite, FavoriteSession, loadFavorites, removeFavorite } from './favorites';
 import { OpenCodeLocations, resolveOpenCodeLocations } from './opencodePaths';
 import { DirectoryMapping } from './pathMapper';
@@ -187,5 +188,11 @@ export class SyncController {
     const outcome = await new SyncManager(this.getLocations(), this.getSettings()).resolveConflicts(keep);
     this.setState({ status: 'idle', lastOutcome: outcome, lastSyncAt: Date.now() });
     return outcome;
+  }
+
+  async buildDebugReport(): Promise<string> {
+    const locations = this.getLocations();
+    const settings = this.getSettings();
+    return buildDebugReport(locations, settings, new SyncManager(locations, settings));
   }
 }
