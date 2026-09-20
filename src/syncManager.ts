@@ -285,7 +285,14 @@ export class SyncManager {
           : await this.applyTree(source, item.localPath, lastPullAt);
     }
 
-    await this.writeLastPullAt(Date.now());
+    // Some filesystems (overlay/network mounts common in containers and CI)
+    // only report mtime to 1-second resolution, truncating rather than
+    // rounding. A local write landing a few ms after this marker could then
+    // be reported with an mtime that reads as *before* it. Backdating the
+    // marker gives that truncation room to land on the safe side, at the
+    // negligible cost of also protecting a local edit made just before this
+    // pull — never the reverse.
+    await this.writeLastPullAt(Date.now() - MTIME_SAFETY_MARGIN_MS);
 
     if (count > 0) {
       messages.push('Restart OpenCode so it reloads the pulled state.');
@@ -435,6 +442,9 @@ export class SyncManager {
 }
 
 const CONFLICT_HINT = 'The sync repository has conflicting changes. Run "OpenCode Sync: Resolve Conflicts".';
+
+/** Covers common 1-second mtime truncation on overlay/network filesystems. */
+const MTIME_SAFETY_MARGIN_MS = 2000;
 
 function isVolatileName(name: string): boolean {
   return VOLATILE_SUFFIXES.some((suffix) => name.endsWith(suffix));

@@ -111,7 +111,10 @@ export interface SyncPlanOptions {
   includeAgentsDir: boolean;
 }
 
-const CONFIG_FILES = ['opencode.json', 'opencode.jsonc', 'AGENTS.md'];
+// 'opencode-session-hub-favorites.json' (see favorites.ts) rides along here
+// unconditionally, same as AGENTS.md — it's just labels + session ids, not
+// secret data, so it syncs regardless of the includeSecrets gate.
+const CONFIG_FILES = ['opencode.json', 'opencode.jsonc', 'AGENTS.md', 'opencode-session-hub-favorites.json'];
 const CONFIG_DIRS = [
   'agent',
   'agents',

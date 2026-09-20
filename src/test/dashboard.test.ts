@@ -54,6 +54,8 @@ describe('sidebar dashboard', () => {
     return stateMsgs[stateMsgs.length - 1];
   }
 
+  let previousConfigDirEnv: string | undefined;
+
   before(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'osh-dash-'));
     remote = path.join(root, 'remote.git');
@@ -72,8 +74,26 @@ describe('sidebar dashboard', () => {
     stub = installVscodeStub();
     stub.config['dataPath'] = machine.dataRoot;
 
+    // SyncController.getLocations() resolves paths against the REAL
+    // process.env (correct for production — a VS Code extension should see
+    // the actual machine's environment). The dataPath setting only overrides
+    // the data root, so without also pointing opencode_config_dir at the
+    // fake machine, anything backed by configRoot (favorites, AGENTS.md,
+    // opencode.json) would read/write the real sandbox's actual
+    // ~/.config/opencode instead of this test's isolated fixture.
+    previousConfigDirEnv = process.env.opencode_config_dir;
+    process.env.opencode_config_dir = machine.configRoot;
+
     DashboardViewProvider = require('../dashboardView').DashboardViewProvider;
     SyncController = require('../syncController').SyncController;
+  });
+
+  after(() => {
+    if (previousConfigDirEnv === undefined) {
+      delete process.env.opencode_config_dir;
+    } else {
+      process.env.opencode_config_dir = previousConfigDirEnv;
+    }
   });
 
   beforeEach(() => {
@@ -197,6 +217,54 @@ describe('sidebar dashboard', () => {
     stub.terminals.length = 0;
     await onMessage({ type: 'resumeSession', id: 'does-not-exist' });
     assert.strictEqual(stub.terminals.length, 0);
+  });
+
+  it('saves a favorite and includes it in the posted state', async () => {
+    await onMessage({
+      type: 'saveFavorite',
+      label: 'Sessao de Desenvolvimento de HTML Hello World',
+      sessionId: 'ses_dash1',
+    });
+
+    const state = latestState();
+    assert.strictEqual(state.favorites.length, 1);
+    assert.strictEqual(state.favorites[0].label, 'Sessao de Desenvolvimento de HTML Hello World');
+    assert.strictEqual(state.favorites[0].sessionId, 'ses_dash1');
+  });
+
+  it('resumes a favorite by looking up its session id on this machine', async () => {
+    stub.terminals.length = 0;
+    await onMessage({ type: 'resumeFavorite', sessionId: 'ses_dash1' });
+
+    assert.strictEqual(stub.terminals.length, 1);
+    assert.deepStrictEqual(stub.terminals[0].sent, ['opencode --session ses_dash1']);
+  });
+
+  it('previews a favorite the same way as a regular session', async () => {
+    stub.webviews.length = 0;
+    await onMessage({ type: 'previewFavorite', sessionId: 'ses_dash1' });
+
+    assert.strictEqual(stub.webviews.length, 1);
+    assert.ok(stub.webviews[0].html.includes('Dashboard demo session'));
+  });
+
+  it('warns instead of crashing when a favorite points at a session not present here', async () => {
+    stub.terminals.length = 0;
+    stub.messages.length = 0;
+
+    await onMessage({ type: 'resumeFavorite', sessionId: 'ses_does_not_exist_anywhere' });
+
+    assert.strictEqual(stub.terminals.length, 0);
+    assert.ok(stub.messages.some((m) => m.kind === 'warn' && m.text.includes('Pull Now')));
+  });
+
+  it('removes a favorite', async () => {
+    await onMessage({ type: 'refresh' });
+    const before = latestState().favorites;
+    await onMessage({ type: 'removeFavorite', id: before[0].id });
+
+    const state = latestState();
+    assert.strictEqual(state.favorites.length, 0);
   });
 
   it('surfaces a sync error to the state instead of throwing out of the handler', async () => {
