@@ -4,6 +4,11 @@
   "description": "Browse every OpenCode session on your machine and keep them synced across workstations via a private Git repository.",
   "version": "0.1.0",
   "publisher": "opencode-session-hub",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brunotrolo/OpenCode_Session_Hub.git"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -165,11 +170,13 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "test": "npm run compile && node --test out/test/"
+    "test": "npm run compile && node --test \"out/test/*.test.js\"",
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0",
     "typescript": "^5.4.0"
   }
 }

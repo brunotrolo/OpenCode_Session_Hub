@@ -89,6 +89,39 @@ Safety rules that apply on every sync:
   never deleted from the repo, so one machine can't wipe the other's history.
 - A local file newer than the synced copy is never overwritten on pull.
 
+## Installing
+
+This extension is not on the Marketplace — install the `.vsix` file directly:
+
+1. Download `opencode-session-hub-<version>.vsix` from the
+   [Releases page](https://github.com/brunotrolo/OpenCode_Session_Hub/releases)
+   (attached automatically to every published release — see below).
+2. In VS Code: Extensions view → `···` menu → **Install from VSIX...** → pick
+   the downloaded file. Or from the terminal:
+   ```bash
+   code --install-extension opencode-session-hub-<version>.vsix
+   ```
+
+### Building the .vsix yourself
+
+```bash
+npm install
+npm run package   # runs vsce package, writes opencode-session-hub-<version>.vsix
+```
+
+### Publishing a release with the .vsix attached
+
+The `.github/workflows/release.yml` workflow builds and attaches the `.vsix`
+automatically whenever a GitHub Release is published:
+
+1. Bump `version` in `package.json`.
+2. Push a tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) and create a
+   GitHub Release from it (or use `gh release create v0.2.0`).
+3. CI runs the tests, packages the `.vsix`, and uploads it as a release asset.
+
+This does **not** publish to the VS Code Marketplace — it only produces an
+installable file attached to the release.
+
 ## Setup
 
 1. Create a **private** Git repository for syncing.
