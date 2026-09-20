@@ -109,6 +109,15 @@ export class SyncManager {
       await this.git(['config', 'user.email', 'opencode-session-hub@localhost']);
       await this.git(['config', 'user.name', 'OpenCode Session Hub']);
     }
+
+    // A Windows machine's global git config very commonly defaults
+    // core.autocrlf=true, which rewrites LF to CRLF on checkout and back on
+    // commit. Left on, every push/pull would silently mutate line endings in
+    // every text file this syncs (opencode.json, AGENTS.md, session JSON),
+    // making the sync repo perpetually "dirty" between machines that don't
+    // share that setting. This repo's own config always wins over the user's
+    // global one, so pin it off regardless of what the user has set globally.
+    await this.git(['config', 'core.autocrlf', 'false']);
   }
 
   /** Fetches the remote branch and merges it into the local mirror. */

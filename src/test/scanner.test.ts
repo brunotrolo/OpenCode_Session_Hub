@@ -116,11 +116,15 @@ describe('path resolution', () => {
   });
 
   it('honors XDG_DATA_HOME and opencode_config_dir', () => {
+    // resolveOpenCodeLocations joins with the HOST's native path separator
+    // (it only takes a `platform` hint for the win32-vs-not env var lookup,
+    // per resolveHomeDir above) — so the expected value must be built the
+    // same way, not hardcoded with '/', or this fails on a real Windows box.
     const locations = resolveOpenCodeLocations(
       { HOME: '/home/u', XDG_DATA_HOME: '/data', opencode_config_dir: '/cfg/oc' },
       'linux'
     );
-    assert.strictEqual(locations.dataRoot, '/data/opencode');
-    assert.strictEqual(locations.configRoot, '/cfg/oc');
+    assert.strictEqual(locations.dataRoot, path.join('/data', 'opencode'));
+    assert.strictEqual(locations.configRoot, path.resolve('/cfg/oc'));
   });
 });

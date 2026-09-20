@@ -47,7 +47,7 @@ export function resolveLocalDirectory(recordedDirectory: string, options: Resolv
   }
 
   for (const root of options.searchRoots) {
-    const candidate = path.join(root, targetName);
+    const candidate = joinPreservingStyle(root, targetName);
     if (exists(candidate)) {
       return candidate;
     }
@@ -67,10 +67,27 @@ export function applyMappings(inputPath: string, mappings: DirectoryMapping[]): 
     const normalizedFrom = mapping.from.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
     if (normalizedInput === normalizedFrom || normalizedInput.startsWith(`${normalizedFrom}/`)) {
       const remainder = inputPath.replace(/\\/g, '/').slice(normalizedFrom.length).replace(/^\/+/, '');
-      return remainder ? path.join(mapping.to, remainder) : mapping.to;
+      return remainder ? joinPreservingStyle(mapping.to, remainder) : mapping.to;
     }
   }
   return inputPath;
+}
+
+/**
+ * `path.join` always uses the HOST OS's separator, which silently mangles a
+ * `mapping.to` written in the other style — e.g. a Windows machine's own
+ * `path.join` would turn a deliberately POSIX destination like
+ * `/home/user/projects` (a WSL path, or a Git Bash user's usual notation)
+ * into `/home/user/projects\repo\src`. `mapping.to` is a string the user
+ * typed for a specific destination convention, not a path meant to be
+ * reinterpreted through whatever OS happens to be running this extension —
+ * so this joins using the separator `mapping.to` itself already uses.
+ */
+function joinPreservingStyle(base: string, remainder: string): string {
+  const sep = base.includes('\\') && !base.includes('/') ? '\\' : '/';
+  const trimmedBase = base.replace(/[\\/]+$/, '');
+  const normalizedRemainder = remainder.split(/[\\/]/).join(sep);
+  return `${trimmedBase}${sep}${normalizedRemainder}`;
 }
 
 /** `path.basename` on POSIX does not split a Windows path, and vice versa. */

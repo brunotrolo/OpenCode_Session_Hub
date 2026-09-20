@@ -39,6 +39,18 @@ Key safety properties, implemented in `syncManager.ts`:
 - **Locked-file retry**: a file copy that fails (e.g. a Windows sharing
   violation) retries a few times, then degrades to a per-file skip message
   instead of failing the whole sync.
+- **No line-ending rewriting**: `ensureRepo()` pins `core.autocrlf=false` on
+  the sync repo regardless of the user's global git config. Without it, a
+  Windows machine with the (very common) global `core.autocrlf=true` would
+  rewrite every text file's line endings on checkout and back on commit,
+  making the sync repo look perpetually dirty between machines that don't
+  share that setting.
+- **Cross-platform-safe directory mappings** (`pathMapper.ts`): a mapping's
+  `to` value and a search root are strings the user typed for a specific
+  destination convention (which can differ from the host OS — e.g. a POSIX
+  path typed on a Windows + Git Bash/WSL setup), so they're joined with
+  `joinPreservingStyle`, not `path.join`, which would silently normalize
+  them to the host's native separator and produce a path that never matches.
 - **Merge, not mirror, for session directories**: a file missing locally is
   never deleted from the repo, so one machine can't wipe another's history.
 - **Local-edit protection**: a file touched since this machine's last
