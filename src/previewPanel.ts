@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
-import { loadSessionMessages, SessionRecord } from './sessionScanner';
+import { OpenCodeLocations } from './opencodePaths';
+import { loadMessages, SessionMessage, SessionRecord } from './sessionScanner';
 
-/** Read-only webview rendering a session's messages as formatted markdown-ish text. */
-export function showSessionPreview(record: SessionRecord) {
+/** Read-only webview rendering a session's messages. */
+export function showSessionPreview(locations: OpenCodeLocations, record: SessionRecord) {
   const panel = vscode.window.createWebviewPanel(
     'opencodeSessionPreview',
     `OpenCode: ${record.title}`,
@@ -10,62 +11,49 @@ export function showSessionPreview(record: SessionRecord) {
     { enableScripts: false }
   );
 
-  const messages = loadSessionMessages(record);
-  panel.webview.html = renderHtml(record, messages);
+  panel.webview.html = renderHtml(record, loadMessages(locations, record));
 }
 
-function renderHtml(record: SessionRecord, messages: ReturnType<typeof loadSessionMessages>): string {
+export function renderHtml(record: SessionRecord, messages: SessionMessage[]): string {
   const body = messages
     .map((msg) => {
-      const role = escapeHtml(String(msg.role ?? 'unknown'));
-      const text = escapeHtml(extractText(msg));
-      return `<section class="msg ${role}"><h3>${role}</h3><pre>${text}</pre></section>`;
+      const role = escapeHtml(msg.role);
+      return `<section class="msg ${role}"><h3>${role}</h3><pre>${escapeHtml(msg.text)}</pre></section>`;
     })
     .join('\n');
 
   return `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
 <style>
   body { font-family: var(--vscode-font-family); padding: 1rem; color: var(--vscode-foreground); }
-  h1 { font-size: 1.1rem; }
+  h1 { font-size: 1.1rem; margin-bottom: 0.25rem; }
   .meta { opacity: 0.7; margin-bottom: 1rem; font-size: 0.85rem; }
-  .msg { border-left: 3px solid var(--vscode-textLink-foreground); padding-left: 0.75rem; margin-bottom: 1rem; }
-  .msg.user { border-color: var(--vscode-charts-blue); }
-  .msg.assistant { border-color: var(--vscode-charts-green); }
-  pre { white-space: pre-wrap; word-break: break-word; }
+  .msg { border-left: 3px solid var(--vscode-panel-border); padding-left: 0.75rem; margin-bottom: 1rem; }
+  .msg h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; margin: 0 0 0.35rem; }
+  .msg.user { border-left-color: var(--vscode-charts-blue); }
+  .msg.assistant { border-left-color: var(--vscode-charts-green); }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: var(--vscode-editor-font-family); }
 </style>
 </head>
 <body>
   <h1>${escapeHtml(record.title)}</h1>
   <div class="meta">
-    ${escapeHtml(record.directory)} · ${new Date(record.updatedAt).toLocaleString()} · ${record.messageCount} messages
+    ${escapeHtml(record.directory || 'unknown directory')} ·
+    ${record.updatedAt ? new Date(record.updatedAt).toLocaleString() : 'no timestamp'} ·
+    ${messages.length} messages · ${escapeHtml(record.source)}
   </div>
-  ${body || '<p>No messages found for this session.</p>'}
+  ${body || '<p>No messages stored for this session.</p>'}
 </body>
 </html>`;
-}
-
-function extractText(msg: Record<string, unknown>): string {
-  if (typeof msg.text === 'string') {
-    return msg.text;
-  }
-  if (typeof msg.content === 'string') {
-    return msg.content;
-  }
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .map((part) => (typeof part === 'string' ? part : (part as { text?: string })?.text ?? ''))
-      .filter(Boolean)
-      .join('\n');
-  }
-  return JSON.stringify(msg, null, 2);
 }
 
 function escapeHtml(input: string): string {
   return input
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }

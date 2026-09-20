@@ -1,29 +1,35 @@
 import * as vscode from 'vscode';
 import { SyncStatus } from './syncManager';
 
-const ICONS: Record<SyncStatus, string> = {
-  idle: '$(check) OpenCode synced',
-  syncing: '$(sync~spin) OpenCode syncing…',
-  error: '$(error) OpenCode sync error',
-  unconfigured: '$(circle-slash) OpenCode sync not configured',
+const PRESENTATION: Record<SyncStatus, { text: string; tooltip: string }> = {
+  idle: { text: '$(check) OpenCode', tooltip: 'OpenCode sessions are in sync. Click to sync now.' },
+  syncing: { text: '$(sync~spin) OpenCode', tooltip: 'Syncing OpenCode sessions…' },
+  error: { text: '$(error) OpenCode', tooltip: 'OpenCode sync failed. Click to retry.' },
+  unconfigured: {
+    text: '$(circle-slash) OpenCode',
+    tooltip: 'OpenCode sync is not configured. Run "OpenCode Sync: Initialize Sync Repository".',
+  },
+  conflict: {
+    text: '$(warning) OpenCode',
+    tooltip: 'OpenCode sync has conflicts. Run "OpenCode Sync: Resolve Conflicts".',
+  },
 };
 
 export class SyncStatusBar {
   private readonly item: vscode.StatusBarItem;
 
-  constructor() {
+  constructor(initial: SyncStatus) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    this.item.command = 'opencodeSessionHub.syncPush';
-    this.set('idle');
+    this.set(initial);
     this.item.show();
   }
 
   set(status: SyncStatus) {
-    this.item.text = ICONS[status];
-    this.item.tooltip =
-      status === 'unconfigured'
-        ? 'Set opencodeSessionHub.syncRemoteUrl to enable session sync.'
-        : 'Click to sync OpenCode sessions now.';
+    const { text, tooltip } = PRESENTATION[status];
+    this.item.text = text;
+    this.item.tooltip = tooltip;
+    this.item.command =
+      status === 'conflict' ? 'opencodeSessionHub.syncResolve' : 'opencodeSessionHub.syncPush';
   }
 
   dispose() {
