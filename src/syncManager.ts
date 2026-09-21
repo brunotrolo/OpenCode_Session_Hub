@@ -3,7 +3,7 @@ import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { mergeManySessionDatabases, mergeSessionDatabases } from './dbMerge';
-import { exportFavoriteSessionFile } from './favoriteSessionExport';
+import { exportSessionFilesBatched } from './favoriteSessionExport';
 import { loadDeletedSessions } from './deletedSessions';
 import { loadFavorites } from './favorites';
 import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
@@ -555,21 +555,31 @@ export class SyncManager {
 
     await fs.mkdir(destDir, { recursive: true });
 
-    for (const [sessionId, label] of targets) {
-      const outputPath = path.join(destDir, `${sessionId}.db`);
-      const result = await exportFavoriteSessionFile(this.locations.databasePath, sessionId, outputPath);
+    // Batched rather than one export call per session: OpenCode's schema has
+    // no index on session_id, so exporting individually costs one full scan
+    // of the message and part tables PER SESSION — on a real multi-GB
+    // database with a few hundred sessions that alone made a push take
+    // minutes. See exportSessionFilesBatched.
+    const results = await exportSessionFilesBatched(
+      this.locations.databasePath,
+      [...targets.keys()].map((sessionId) => ({ sessionId, outputPath: path.join(destDir, `${sessionId}.db`) }))
+    );
+
+    for (const result of results) {
+      const label = targets.get(result.sessionId) ?? result.sessionId;
       if (!result.ok) {
-        messages.push(`Session "${label}" (${sessionId}) not synced: ${result.error}`);
+        messages.push(`Session "${label}" (${result.sessionId}) not synced: ${result.error}`);
         continue;
       }
 
       // One session's worth of messages should essentially never hit this —
       // but a runaway single session (huge tool output, say) is exactly the
       // kind of thing this whole feature exists to route around, not repeat.
+      const outputPath = path.join(destDir, `${result.sessionId}.db`);
       const oversized = await this.checkOversizedFile(outputPath);
       if (oversized) {
         await fs.rm(outputPath, { force: true });
-        messages.push(`Session "${label}" (${sessionId}) not synced: ${oversized}`);
+        messages.push(`Session "${label}" (${result.sessionId}) not synced: ${oversized}`);
       }
     }
 

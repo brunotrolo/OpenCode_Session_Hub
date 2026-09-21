@@ -20,6 +20,8 @@ export interface StubState {
   viewProviders: Map<string, unknown>;
   /** Commands invoked via vscode.commands.executeCommand(...), in order. */
   executedCommands: string[];
+  /** Lines written to the extension's output channel. */
+  outputLines: string[];
 }
 
 export function installVscodeStub(): StubState {
@@ -35,6 +37,7 @@ export function installVscodeStub(): StubState {
     statusBar: { text: '', tooltip: '', command: '' },
     disposed: false,
     executedCommands: [],
+    outputLines: [],
     viewProviders: new Map(),
   };
 
@@ -71,7 +74,16 @@ export function installVscodeStub(): StubState {
       }),
     },
     window: {
-      createOutputChannel: () => ({ appendLine: () => undefined, dispose: () => undefined }),
+      createOutputChannel: () => ({
+        appendLine: (line: string) => state.outputLines.push(line),
+        append: (text: string) => state.outputLines.push(text),
+        clear: () => {
+          state.outputLines.length = 0;
+        },
+        show: () => undefined,
+        hide: () => undefined,
+        dispose: () => undefined,
+      }),
       createStatusBarItem: () => ({
         get text() {
           return state.statusBar.text;

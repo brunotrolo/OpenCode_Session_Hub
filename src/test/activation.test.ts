@@ -138,4 +138,81 @@ describe('extension activation and commands', () => {
     await stub.commands.get('opencodeSessionHub.listAllSessions')!();
     assert.strictEqual(stub.terminals.length, 1, 'no extra terminal should be created on cancel');
   });
+
+  it('deletes a session from the command palette, and only after confirmation', async () => {
+    // Deletion is async now (the SQLite rows are removed in a child process
+    // so a large database can't freeze the extension host), so this asserts
+    // the command actually awaits it — a non-awaited delete would report
+    // success while the session is still there.
+    addStorageSession(machine, {
+      projectId: 'prj_alpha',
+      sessionId: 'ses_cmd_delete',
+      title: 'Command palette delete target',
+      worktree: path.join(root, 'projects', 'demo'),
+    });
+
+    const pickTarget = (items: unknown[]) => {
+      const list = items as { label: string; action?: string; record?: { id: string } }[];
+      const action = list.find((item) => item.action === 'delete');
+      if (action) {
+        return action;
+      }
+      return list.find((item) => item.record?.id === 'ses_cmd_delete') ?? list[0];
+    };
+
+    // Cancelling the confirmation must leave the session alone.
+    stub.quickPickResponder = pickTarget;
+    stub.warningResponder = () => undefined;
+    await stub.commands.get('opencodeSessionHub.listAllSessions')!();
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { scanSessions } = require('../sessionScanner');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { resolveOpenCodeLocations } = require('../opencodePaths');
+    const locations = resolveOpenCodeLocations(machine.env, 'linux');
+    assert.ok(
+      scanSessions(locations).sessions.some((s: { id: string }) => s.id === 'ses_cmd_delete'),
+      'cancelling the confirmation must not delete anything'
+    );
+
+    // Confirming deletes it.
+    stub.warningResponder = () => 'Delete';
+    await stub.commands.get('opencodeSessionHub.listAllSessions')!();
+    assert.ok(
+      !scanSessions(locations).sessions.some((s: { id: string }) => s.id === 'ses_cmd_delete'),
+      'confirming must actually remove the session by the time the command resolves'
+    );
+  });
+
+  it('shows a debug report without throwing', async () => {
+    stub.webviews.length = 0;
+    stub.messages.length = 0;
+    await stub.commands.get('opencodeSessionHub.showDebugInfo')!();
+    const shown = stub.webviews.map((w) => w.html).join('\n') + stub.messages.map((m) => m.text).join('\n');
+    assert.ok(shown.length > 0, 'the debug command must surface something the user can read');
+  });
+
+  it('reports sync status without a remote instead of throwing', async () => {
+    stub.messages.length = 0;
+    await stub.commands.get('opencodeSessionHub.syncStatus')!();
+    assert.ok(stub.messages.length > 0, 'status must tell the user something');
+  });
+
+  it('cancels init/link cleanly when no URL is entered', async () => {
+    stub.inputResponder = () => undefined;
+    stub.messages.length = 0;
+    await stub.commands.get('opencodeSessionHub.syncInit')!();
+    await stub.commands.get('opencodeSessionHub.syncLink')!();
+    // Dismissing the prompt must not configure anything or throw.
+    assert.strictEqual(stub.config['syncRemoteUrl'], undefined);
+  });
+
+  it('opens the dashboard view', async () => {
+    stub.executedCommands.length = 0;
+    await stub.commands.get('opencodeSessionHub.openDashboard')!();
+    assert.ok(
+      stub.executedCommands.length > 0,
+      'opening the dashboard should focus its view via a command'
+    );
+  });
 });

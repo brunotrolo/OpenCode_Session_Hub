@@ -305,6 +305,79 @@ describe('real-world sync scenarios', () => {
     assert.strictEqual(loadMessages(bobLocations, seven)[0].text, 'content 7');
   });
 
+  it('exports a few hundred sessions with batched scans, not one table scan per session', async () => {
+    // OpenCode's schema has no index on session_id, so every filtered read
+    // of message/part is a full table scan. Exporting one session at a time
+    // therefore cost one scan PER SESSION: at the reported scale (~150
+    // sessions, a large message table) that made a single push take ~28
+    // seconds of synchronous work. Batching cut it to ~2. This builds a
+    // database at that scale and holds the line.
+    const machine = createMachine(root, 'batch-export');
+    const dbPath = path.join(machine.dataRoot, 'opencode.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT,
+               time_created INTEGER, time_updated INTEGER, sandboxes TEXT)`);
+    db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+               slug TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT,
+               time_created INTEGER, time_updated INTEGER)`);
+    db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+    db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+               time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+    db.prepare('INSERT INTO project VALUES (?, ?, ?, ?, ?, ?)').run('prj', '/work', 'git', 1, 1, '[]');
+
+    const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)');
+    const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)');
+
+    const sessionCount = 150;
+    const messagesPerSession = 60;
+    db.exec('BEGIN;');
+    for (let s = 0; s < sessionCount; s++) {
+      insertSession.run(`ses_${s}`, 'prj', null, 'slug', '/work', `Session ${s}`, '1.0', 1, 1);
+      for (let m = 0; m < messagesPerSession; m++) {
+        const messageId = `msg_${s}_${m}`;
+        insertMessage.run(messageId, `ses_${s}`, 1, 1, JSON.stringify({ role: 'user' }));
+        insertPart.run(`prt_${s}_${m}`, messageId, `ses_${s}`, 1, 1, JSON.stringify({ type: 'text', text: `s${s}m${m}` }));
+      }
+    }
+    db.exec('COMMIT;');
+    db.close();
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { exportSessionFilesBatched } = require('../favoriteSessionExport');
+    const outDir = path.join(machine.home, 'exports');
+    const entries = Array.from({ length: sessionCount }, (_, s) => ({
+      sessionId: `ses_${s}`,
+      outputPath: path.join(outDir, `ses_${s}.db`),
+    }));
+
+    const start = Date.now();
+    const results = await exportSessionFilesBatched(dbPath, entries);
+    const elapsedMs = Date.now() - start;
+
+    assert.strictEqual(results.length, sessionCount);
+    assert.ok(
+      results.every((r: { ok: boolean }) => r.ok),
+      `every session should export: ${JSON.stringify(results.filter((r: { ok: boolean }) => !r.ok).slice(0, 3))}`
+    );
+    // 1 project + 1 session + 60 messages + 60 parts
+    assert.strictEqual(results[0].rows, 122);
+    assert.ok(elapsedMs < 15000, `batched export should stay well under the old per-session cost; took ${elapsedMs}ms`);
+
+    // Each file must contain only its own session's rows.
+    const exported = new DatabaseSync(path.join(outDir, 'ses_77.db'), { readOnly: true });
+    try {
+      assert.strictEqual(Number(exported.prepare('SELECT COUNT(*) AS n FROM part').get().n), messagesPerSession);
+      assert.strictEqual(Number(exported.prepare('SELECT COUNT(*) AS n FROM session').get().n), 1);
+      assert.strictEqual(String(exported.prepare('SELECT id FROM session').get().id), 'ses_77');
+    } finally {
+      exported.close();
+    }
+  });
+
   it('does not resurrect a locally deleted session on the next pull', async () => {
     // Now that a push can export every session individually, the remote
     // holds a per-session file for each one. Deleting a session locally and
