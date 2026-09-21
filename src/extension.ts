@@ -49,6 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
   register('opencodeSessionHub.showDebugInfo', () => showDebugInfo());
   register('opencodeSessionHub.compactDatabase', () => compactDatabase());
+  register('opencodeSessionHub.rebuildMirror', () => rebuildMirror());
 
   const config = vscode.workspace.getConfiguration('opencodeSessionHub');
   if (config.get<boolean>('autoPullOnStartup', true) && controller.getSettings().remoteUrl) {
@@ -152,6 +153,44 @@ async function showDebugInfo() {
   output.appendLine(report);
   output.show(true);
   vscode.window.showInformationMessage('OpenCode Session Hub debug info written to the Output panel.');
+}
+
+/**
+ * Recovery for a sync repo whose unpushed history GitHub will never accept
+ * — most often a blob over its 100 MB limit, which makes every push fail
+ * with no way forward otherwise. Confirmed first because it does discard
+ * local commits, but the confirmation says plainly what is and isn't at
+ * risk: the mirror is a scratch copy, so no session data and nothing
+ * already on GitHub can be lost.
+ */
+async function rebuildMirror() {
+  const choice = await vscode.window.showWarningMessage(
+    'Rebuild the local sync mirror from the remote? Any commits made here but never pushed will be discarded — ' +
+      'that is usually the point, since this exists to clear history GitHub refuses to accept. Your OpenCode ' +
+      'sessions and everything already on GitHub are NOT touched; the mirror is only a scratch copy and the ' +
+      'next push re-uploads this machine\'s current state.',
+    { modal: true },
+    'Rebuild Mirror'
+  );
+  if (choice !== 'Rebuild Mirror') {
+    return;
+  }
+
+  try {
+    const result = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'OpenCode: rebuilding the sync mirror' },
+      () => controller.rebuildMirror()
+    );
+    vscode.window.showInformationMessage(
+      `OpenCode Session Hub: mirror rebuilt${
+        result.discardedCommits > 0 ? ` (${result.discardedCommits} unpushed commit(s) discarded)` : ''
+      }. Run "Push Now" to upload this machine's current state.`
+    );
+  } catch (err) {
+    vscode.window.showErrorMessage(
+      `OpenCode Session Hub: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 /**

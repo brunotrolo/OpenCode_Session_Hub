@@ -17,10 +17,18 @@ const OVERSIZED_FILE_SKIP_MB = 90;
  * can't show: real file sizes/timestamps on disk versus what was actually
  * last committed to the sync repo.
  */
+export interface DebugSyncState {
+  /** The error from the last failed sync, if the last one failed. */
+  lastError?: string;
+  status?: string;
+  lastSyncAt?: number;
+}
+
 export async function buildDebugReport(
   locations: OpenCodeLocations,
   settings: SyncSettings,
-  manager: SyncManager
+  manager: SyncManager,
+  syncState: DebugSyncState = {}
 ): Promise<string> {
   const lines: string[] = [];
   lines.push('=== OpenCode Session Hub — Debug Report ===');
@@ -107,6 +115,22 @@ export async function buildDebugReport(
     for (const favorite of favorites) {
       lines.push(`  ${favorite.sessionId} — "${favorite.label}"`);
     }
+  }
+  lines.push('');
+
+  // Without this the report showed a repo happily N commits ahead and gave
+  // no hint that every push had been failing — the error only ever appeared
+  // in a transient notification the user had long since dismissed.
+  lines.push('-- Last sync result --');
+  if (syncState.lastError) {
+    lines.push(`LAST SYNC FAILED: ${syncState.lastError}`);
+  } else if (syncState.status === 'syncing') {
+    lines.push('A sync is running right now (no failure recorded yet).');
+  } else {
+    lines.push('No sync error recorded.');
+  }
+  if (syncState.lastSyncAt) {
+    lines.push(`Last sync finished: ${new Date(syncState.lastSyncAt).toISOString()}`);
   }
   lines.push('');
 

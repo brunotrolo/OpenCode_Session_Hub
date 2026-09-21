@@ -32,6 +32,7 @@ type Inbound =
   | { type: 'openFullList' }
   | { type: 'showDebugInfo' }
   | { type: 'compactDatabase' }
+  | { type: 'rebuildMirror' }
   | { type: 'saveFavorite'; label: string; sessionId: string }
   | { type: 'removeFavorite'; id: string }
   | { type: 'previewFavorite'; sessionId: string }
@@ -139,6 +140,12 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
         case 'compactDatabase':
           await vscode.commands.executeCommand('opencodeSessionHub.compactDatabase');
+          this.postState();
+          return;
+
+        case 'rebuildMirror':
+          await vscode.commands.executeCommand('opencodeSessionHub.rebuildMirror');
+          await this.controller.refreshStatus();
           this.postState();
           return;
 
@@ -342,6 +349,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     <button id="btn-refresh" class="secondary">Refresh</button>
     <button id="btn-debug" class="secondary">Show Debug Info</button>
     <button id="btn-compact-db" class="secondary">Compact Database…</button>
+    <button id="btn-rebuild-mirror" class="secondary">Rebuild Mirror…</button>
   </div>
   <div id="conflict-row" class="row" style="display:none">
     <button id="btn-keep-local">Keep Local</button>
@@ -483,6 +491,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   $('btn-refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
   $('btn-debug').addEventListener('click', () => vscode.postMessage({ type: 'showDebugInfo' }));
   $('btn-compact-db').addEventListener('click', () => vscode.postMessage({ type: 'compactDatabase' }));
+  $('btn-rebuild-mirror').addEventListener('click', () => vscode.postMessage({ type: 'rebuildMirror' }));
   $('btn-keep-local').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'local' }));
   $('btn-keep-remote').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'remote' }));
   $('btn-open-list').addEventListener('click', () => vscode.postMessage({ type: 'openFullList' }));

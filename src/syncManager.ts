@@ -3,7 +3,7 @@ import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { mergeManySessionDatabases, mergeSessionDatabases } from './dbMerge';
-import { exportSessionFilesOffThread } from './favoriteSessionExport';
+import { exportSessionFilesOffThread, removeStrayExportTempFiles } from './favoriteSessionExport';
 import { loadDeletedSessions } from './deletedSessions';
 import { loadFavorites } from './favorites';
 import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
@@ -153,6 +153,24 @@ export class SyncManager {
     // share that setting. This repo's own config always wins over the user's
     // global one, so pin it off regardless of what the user has set globally.
     await this.git(['config', 'core.autocrlf', 'false']);
+
+    // Second line of defense behind removeStrayExportTempFiles: even if an
+    // export is interrupted at the worst possible moment, `git add -A` must
+    // never be able to commit a scratch file. One of these reached a real
+    // repo at over GitHub's 100 MB limit and blocked every push from then on.
+    //
+    // This goes in .git/info/exclude rather than a committed .gitignore:
+    // the rule is machine-local plumbing, nothing the other machines need,
+    // and an untracked .gitignore in the working tree would block the very
+    // first `git checkout -B <branch> origin/<branch>` on a fresh mirror.
+    const excludePath = path.join(this.repoDir, '.git', 'info', 'exclude');
+    const excludeRule = '*.tmp-*';
+    const existingExclude = (await readFileOrNull(excludePath)) ?? '';
+    if (!existingExclude.split('\n').some((line) => line.trim() === excludeRule)) {
+      const separator = existingExclude === '' || existingExclude.endsWith('\n') ? '' : '\n';
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      await fs.writeFile(excludePath, `${existingExclude}${separator}${excludeRule}\n`, 'utf8');
+    }
   }
 
   /**
@@ -182,7 +200,19 @@ export class SyncManager {
   private async fetchAndIntegrate(): Promise<{ conflicted: boolean; messages: string[] }> {
     const fetch = await this.git(['fetch', 'origin', this.settings.branch], { allowFailure: true });
     if (fetch.code !== 0) {
-      // A freshly created empty remote has no branch yet; not an error.
+      // Only ONE fetch failure is benign: a freshly created remote that has
+      // no such branch yet. Treating every failure that way (as this used
+      // to) silently turns an authentication or network problem into a
+      // successful-looking sync — the push then commits locally and fails
+      // at the end, so commits pile up unpushed while the panel reports
+      // success. A real report reached 16 unpushed commits this way.
+      if (!isMissingRemoteBranch(fetch.stderr)) {
+        throw new SyncError(
+          `Could not reach the sync repository: ${fetch.stderr.trim() || `git fetch exited with code ${fetch.code}`}. ` +
+            'Nothing was synced. Check the remote URL, your network, and that your git credentials for ' +
+            'GitHub are still valid.'
+        );
+      }
       return { conflicted: false, messages: [] };
     }
 
@@ -340,16 +370,67 @@ export class SyncManager {
     if (oversizedHistory.oversizedPaths.length > 0) {
       throw new SyncError(
         `Refusing to push: ${oversizedHistory.unpushedCommits} unpushed commit(s) already contain file(s) over ` +
-          `GitHub's size limit: ${oversizedHistory.oversizedPaths.join(', ')}. This predates the current ` +
-          "oversized-file skip, or came from something else entirely. Fix it with 'git filter-repo' (or " +
-          `BFG Repo-Cleaner) in ${this.repoDir} to remove it from history, or reset the local mirror and let the ` +
-          'next push rebuild it clean (only safe if no other machine needs this history).'
+          `GitHub's size limit: ${oversizedHistory.oversizedPaths.join(', ')}. GitHub would reject the push ` +
+          'anyway. Run "OpenCode Sync: Rebuild Local Mirror" (or the Rebuild Mirror button in the sidebar) to ' +
+          'discard this unpushed local history and rebuild the mirror from the remote — nothing on GitHub or ' +
+          'in your OpenCode data is touched, only this machine\'s scratch copy of the repo.'
       );
     }
 
     await this.git(['push', '-u', 'origin', this.settings.branch]);
 
     return { status: 'ok', messages, changedFiles: staged ? staged.split('\n').length : 0 };
+  }
+
+  /**
+   * Throws away this machine's local copy of the sync repo and rebuilds it
+   * from the remote.
+   *
+   * This is the recovery path for a mirror whose unpushed history is
+   * unpushable — most concretely, one carrying a blob over GitHub's 100 MB
+   * limit, which makes every push fail forever with no way forward short of
+   * git surgery the user should never have to do. Because the mirror is only
+   * ever a scratch copy of what's already on GitHub plus what can be
+   * regenerated from local OpenCode data, deleting it is safe in a way that
+   * deleting a normal repository would not be: nothing on the remote is
+   * touched, and no OpenCode session data lives here.
+   *
+   * The one real cost is any commit that exists ONLY here and was never
+   * pushed — which, when this is needed, is exactly the unpushable history
+   * being discarded. The count is reported so the caller can confirm with
+   * the user first.
+   */
+  async rebuildMirror(): Promise<{ discardedCommits: number; messages: string[] }> {
+    if (!this.settings.remoteUrl) {
+      throw new SyncError('Set opencodeSessionHub.syncRemoteUrl before rebuilding the mirror.');
+    }
+
+    const messages: string[] = [];
+    let discardedCommits = 0;
+    if (await exists(path.join(this.repoDir, '.git'))) {
+      const ahead = await this.git(['rev-list', '--count', `origin/${this.settings.branch}..HEAD`], {
+        allowFailure: true,
+      });
+      const count = Number(ahead.stdout.trim());
+      discardedCommits = ahead.code === 0 && Number.isFinite(count) ? count : 0;
+    }
+
+    await fs.rm(this.repoDir, { recursive: true, force: true });
+    messages.push('Deleted the local mirror.');
+
+    // ensureRepo re-initializes it; the fetch then repopulates from the
+    // remote, exactly as it does on a machine syncing for the first time.
+    await this.ensureRepo();
+    const integration = await this.fetchAndIntegrate();
+    messages.push(...integration.messages);
+    messages.push(
+      discardedCommits > 0
+        ? `Rebuilt from ${this.settings.remoteUrl} — ${discardedCommits} unpushed local commit(s) were discarded.`
+        : `Rebuilt from ${this.settings.remoteUrl}.`
+    );
+    messages.push('Run a push to re-upload this machine\'s current state.');
+
+    return { discardedCommits, messages };
   }
 
   /** origin/<branch> is a remote-tracking ref refreshed by fetchAndIntegrate's own fetch. */
@@ -535,6 +616,18 @@ export class SyncManager {
 
     const destDir = path.join(this.repoDir, ...FAVORITE_SESSIONS_REPO_DIR.split('/'));
 
+    // Scratch files from an older build (which wrote them beside the output,
+    // inside the repo) are still on disk in an existing mirror, and every
+    // `git add -A` commits them again. One real repo had five, one of them
+    // over GitHub's 100 MB limit, which blocked every push.
+    const strays = await removeStrayExportTempFiles(destDir);
+    if (strays.length > 0) {
+      messages.push(
+        `Removed ${strays.length} leftover export scratch file(s) from the sync repo — an interrupted export ` +
+          'left them behind, and they were being committed. They are written outside the repo now.'
+      );
+    }
+
     // A session deleted on this machine must also leave the mirror, or its
     // still-present export file re-seeds it here on the next pull and onto
     // every other machine too. Removing the file is what makes a deletion
@@ -576,10 +669,20 @@ export class SyncManager {
       // but a runaway single session (huge tool output, say) is exactly the
       // kind of thing this whole feature exists to route around, not repeat.
       const outputPath = path.join(destDir, `${result.sessionId}.db`);
-      const oversized = await this.checkOversizedFile(outputPath);
-      if (oversized) {
+      const stat = await statOrNull(outputPath);
+      if (stat && stat.size > OVERSIZED_FILE_SKIP_BYTES) {
         await fs.rm(outputPath, { force: true });
-        messages.push(`Session "${label}" (${result.sessionId}) not synced: ${oversized}`);
+        // Deliberately not checkOversizedFile()'s wording: that one tells
+        // the user to compact opencode.db, which does nothing for a single
+        // session that is genuinely this large on its own (a very long
+        // session with big tool outputs). The honest answer is that this
+        // one session can't sync, and which one it is.
+        messages.push(
+          `Session "${label}" (${result.sessionId}) is too large to sync on its own: ` +
+            `${(stat.size / (1024 * 1024)).toFixed(0)} MB exceeds the ` +
+            `${OVERSIZED_FILE_SKIP_BYTES / (1024 * 1024)} MB limit (GitHub rejects any file over 100 MB). ` +
+            'Every other session still synced. This one stays on this machine only unless you shorten it.'
+        );
       }
     }
 
@@ -762,6 +865,54 @@ export class SyncManager {
     lines.push(
       `Last successful pull completed on this machine: ${lastPullAt ? new Date(lastPullAt).toISOString() : '(never)'}`
     );
+
+    // The question a "16 ahead" badge raises and can't answer: are those
+    // commits stuck, and why? An ahead count alone reads as normal, so this
+    // spells out the consequence and probes the remote for the actual git
+    // error — which is otherwise only visible in a failed sync's message.
+    const ahead = await this.git(['rev-list', '--count', `origin/${this.settings.branch}..HEAD`], {
+      allowFailure: true,
+    });
+    const aheadCount = Number(ahead.stdout.trim());
+    if (ahead.code === 0 && Number.isFinite(aheadCount) && aheadCount > 0) {
+      lines.push(
+        `Unpushed commits: ${aheadCount} — these are committed locally but NOT on GitHub. ` +
+          'Everything in them is still only on this machine.'
+      );
+      const unpushedFiles = await this.git(
+        ['diff', '--stat', `origin/${this.settings.branch}..HEAD`],
+        { allowFailure: true }
+      );
+      const summary = unpushedFiles.stdout.trim().split('\n').slice(-1)[0];
+      if (summary) {
+        lines.push(`  Unpushed changes: ${summary.trim()}`);
+      }
+    } else if (ahead.code === 0) {
+      lines.push('Unpushed commits: none — everything committed here is on GitHub.');
+    }
+
+    // A live reachability/auth check against the real remote. This is the
+    // one thing that distinguishes "the remote is fine, nothing to send"
+    // from "every push has been failing", and it reports git's own error
+    // text rather than a paraphrase.
+    if (this.settings.remoteUrl) {
+      const probe = await this.git(['ls-remote', '--heads', 'origin', this.settings.branch], {
+        allowFailure: true,
+      });
+      if (probe.code === 0) {
+        lines.push(
+          `Remote reachable: yes${probe.stdout.trim() ? '' : ` (branch "${this.settings.branch}" does not exist there yet)`}`
+        );
+      } else {
+        lines.push(
+          `Remote reachable: NO — ${probe.stderr.trim() || `git ls-remote exited with code ${probe.code}`}`
+        );
+        lines.push(
+          '  Every push is failing for this reason. Nothing reaches GitHub until it is fixed — check the ' +
+            'remote URL above, your network, and whether your stored GitHub credentials are still valid.'
+        );
+      }
+    }
 
     const lockPath = path.join(this.repoDir, '.git', 'index.lock');
     const lockStat = await statOrNull(lockPath);
@@ -1280,6 +1431,17 @@ const MAX_HISTORY_SCAN_COMMITS = 100;
  */
 const STALE_INDEX_LOCK_AGE_MS = 2 * 60 * 1000;
 
+/**
+ * True only for the one benign `git fetch` failure: the remote exists and is
+ * reachable, but has no such branch yet (a repository created empty, before
+ * anything was ever pushed to it). Every other failure — bad credentials, no
+ * network, wrong URL, DNS — means nothing was fetched and must not be
+ * mistaken for an empty remote.
+ */
+function isMissingRemoteBranch(stderr: string): boolean {
+  return /couldn't find remote ref|couldn't find remote branch|no such ref was fetched/i.test(stderr);
+}
+
 function isVolatileName(name: string): boolean {
   return VOLATILE_SUFFIXES.some((suffix) => name.endsWith(suffix));
 }
@@ -1331,6 +1493,14 @@ async function tryCheckpointDatabase(databasePath: string): Promise<boolean> {
 
 async function exists(target: string): Promise<boolean> {
   return (await statOrNull(target)) !== null;
+}
+
+async function readFileOrNull(target: string): Promise<string | null> {
+  try {
+    return await fs.readFile(target, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 async function statOrNull(target: string) {

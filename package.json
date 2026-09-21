@@ -52,6 +52,11 @@
         "title": "OpenCode Sync: Compact Database (VACUUM)"
       },
       {
+        "command": "opencodeSessionHub.rebuildMirror",
+        "title": "OpenCode Sync: Rebuild Local Mirror",
+        "category": "OpenCode"
+      },
+      {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"
       },

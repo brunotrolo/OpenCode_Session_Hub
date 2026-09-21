@@ -246,10 +246,40 @@ export class SyncController {
     return outcome;
   }
 
+  /**
+   * Recovery for a mirror whose unpushed history can never be accepted by
+   * GitHub (see SyncManager.rebuildMirror). Serialized through the same
+   * queue as every other repo operation, so it can't run while a sync is
+   * mid-flight on the same directory.
+   */
+  async rebuildMirror(): Promise<{ discardedCommits: number; messages: string[] }> {
+    return this.enqueue(async () => {
+      const settings = this.getSettings();
+      this.setState({ status: 'syncing' });
+      try {
+        const result = await new SyncManager(this.getLocations(), settings).rebuildMirror();
+        for (const message of result.messages) {
+          this.log(message);
+        }
+        this.setState({ status: 'idle', lastError: undefined, lastSyncAt: Date.now() });
+        return result;
+      } catch (err) {
+        const message = err instanceof SyncError ? err.message : String(err);
+        this.log(`rebuild mirror failed: ${message}`);
+        this.setState({ status: 'error', lastError: message });
+        throw err;
+      }
+    });
+  }
+
   async buildDebugReport(): Promise<string> {
     const locations = this.getLocations();
     const settings = this.getSettings();
-    return buildDebugReport(locations, settings, new SyncManager(locations, settings));
+    return buildDebugReport(locations, settings, new SyncManager(locations, settings), {
+      lastError: this.state.lastError,
+      status: this.state.status,
+      lastSyncAt: this.state.lastSyncAt,
+    });
   }
 
   /**

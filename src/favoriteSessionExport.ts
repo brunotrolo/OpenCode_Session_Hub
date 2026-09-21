@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 /**
@@ -45,6 +46,76 @@ const SESSION_TABLES: { name: string; sessionIdColumn: string }[] = [
  * while never holding more than a chunk's worth of rows at once.
  */
 const EXPORT_CHUNK_SIZE = 25;
+
+/**
+ * A scratch path for the half-written export, in the OS temp directory
+ * rather than beside the final file.
+ *
+ * The export writes to a temporary file and renames it into place so a
+ * crash can never leave a half-written database where a complete one is
+ * expected. But the destination lives INSIDE the sync repo's working tree,
+ * so putting the scratch file beside it meant an interrupted export (a VS
+ * Code restart or extension-host reload mid-export — which a multi-GB
+ * database made likely) left `<id>.db.tmp-<pid>-<ts>` behind, and the next
+ * `git add -A` committed it. A real repo accumulated five such files from
+ * five different runs, one of them over GitHub's 100 MB limit, which then
+ * blocked every push. Keeping scratch files out of the repo entirely means
+ * that cannot happen again, whatever goes wrong mid-export.
+ */
+function scratchPathFor(outputPath: string): string {
+  return path.join(
+    os.tmpdir(),
+    `opencode-session-hub-${process.pid}-${Date.now()}-${path.basename(outputPath)}`
+  );
+}
+
+/**
+ * Removes scratch files an older build left inside the repo. Without this,
+ * an existing mirror keeps committing the ones already on disk forever.
+ */
+export async function removeStrayExportTempFiles(directory: string): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(directory);
+  } catch {
+    return [];
+  }
+
+  const removed: string[] = [];
+  for (const name of entries) {
+    if (!/\.tmp-\d+-\d+$/.test(name)) {
+      continue;
+    }
+    try {
+      await fs.promises.rm(path.join(directory, name), { force: true });
+      removed.push(name);
+    } catch {
+      // Best-effort: a locked stray file shouldn't fail the whole sync.
+    }
+  }
+  return removed;
+}
+
+/**
+ * Moves the finished export into the repo. A plain rename fails with EXDEV
+ * when the OS temp directory and the repo are on different filesystems
+ * (routine on Windows, where TEMP is often on a different volume), so fall
+ * back to copy-then-delete. The copy still lands atomically enough for our
+ * purposes: readers only ever see the destination once it is complete,
+ * because nothing reads it until the push that follows.
+ */
+async function moveIntoPlace(tmpPath: string, outputPath: string): Promise<void> {
+  await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+  try {
+    await fs.promises.rename(tmpPath, outputPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'EXDEV') {
+      throw err;
+    }
+    await fs.promises.copyFile(tmpPath, outputPath);
+    await fs.promises.rm(tmpPath, { force: true });
+  }
+}
 
 export interface BatchExportEntry {
   sessionId: string;
@@ -271,10 +342,9 @@ async function exportChunk(
       continue;
     }
 
-    const tmpPath = `${entry.outputPath}.tmp-${process.pid}-${Date.now()}`;
+    const tmpPath = scratchPathFor(entry.outputPath);
     let output: ExportHandle | undefined;
     try {
-      await fs.promises.mkdir(path.dirname(tmpPath), { recursive: true });
       await fs.promises.rm(tmpPath, { force: true });
       output = new DatabaseSync(tmpPath);
 
@@ -298,7 +368,7 @@ async function exportChunk(
 
       output.close();
       output = undefined;
-      await fs.promises.rename(tmpPath, entry.outputPath);
+      await moveIntoPlace(tmpPath, entry.outputPath);
       results.push({ sessionId: entry.sessionId, ok: true, rows });
     } catch (err) {
       results.push({ sessionId: entry.sessionId, ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -380,7 +450,7 @@ export async function exportFavoriteSessionFile(
 
   let source: ExportHandle | undefined;
   let output: ExportHandle | undefined;
-  const tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}`;
+  const tmpPath = scratchPathFor(outputPath);
 
   try {
     source = new DatabaseSync(databasePath, { readOnly: true });
@@ -390,7 +460,6 @@ export async function exportFavoriteSessionFile(
       return { ok: false, error: `session ${sessionId} not found in opencode.db on this machine` };
     }
 
-    await fs.promises.mkdir(path.dirname(tmpPath), { recursive: true });
     await fs.promises.rm(tmpPath, { force: true });
     output = new DatabaseSync(tmpPath);
 
@@ -410,7 +479,7 @@ export async function exportFavoriteSessionFile(
 
     output.close();
     output = undefined;
-    await fs.promises.rename(tmpPath, outputPath);
+    await moveIntoPlace(tmpPath, outputPath);
 
     return { ok: true, rows };
   } catch (err) {
