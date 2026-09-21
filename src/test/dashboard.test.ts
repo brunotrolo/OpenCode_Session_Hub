@@ -120,6 +120,16 @@ describe('sidebar dashboard', () => {
     assert.strictEqual(state.settings.remoteUrl, remote);
   });
 
+  it('fixes an accidentally self-pasted remote URL (URLURL) instead of saving it broken', async () => {
+    // Reproduces a real report: pasting into the Remote URL field when it
+    // already held the same value produced "https://...my-repohttps://...my-repo"
+    // — no separator, so every fetch/push against it just fails, which read
+    // as "stuck syncing forever" rather than a clear bad-URL error.
+    await onMessage({ type: 'saveConnection', remoteUrl: remote + remote, branch: 'main' });
+    const state = latestState();
+    assert.strictEqual(state.settings.remoteUrl, remote);
+  });
+
   it('push runs a real sync and updates health', async () => {
     await onMessage({ type: 'saveConnection', remoteUrl: remote, branch: 'main' });
     await onMessage({ type: 'push' });
@@ -301,5 +311,55 @@ describe('sidebar dashboard', () => {
     const state = latestState();
     assert.strictEqual(state.state.status, 'error');
     assert.ok(state.state.lastError);
+  });
+
+  it('never runs two sync operations against the repo concurrently', async () => {
+    // Reproduces the real failure this guards against: a debounced
+    // auto-push firing while a manual push is still in flight (or two
+    // rapid clicks) used to start two SyncManager instances against the
+    // exact same repoDir at once — one's `git add`/commit could read a
+    // file the other was still writing mid-mutation, which is exactly how
+    // a real report got "git add -A failed: fatal: confused by unstable
+    // object source data". Instruments SyncManager.push/pull directly to
+    // prove the controller's queue serializes them instead of racing.
+    await onMessage({ type: 'saveConnection', remoteUrl: remote, branch: 'main' });
+
+    const syncManagerModule = require('../syncManager');
+    const originalPush = syncManagerModule.SyncManager.prototype.push;
+    const originalPull = syncManagerModule.SyncManager.prototype.pull;
+    let active = 0;
+    let maxActive = 0;
+
+    async function instrumented(this: unknown, original: () => Promise<unknown>) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      try {
+        // Yield a tick so two overlapping calls, if the queue failed to
+        // serialize them, would actually overlap in practice rather than
+        // finishing before the second one even starts.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return await original.call(this);
+      } finally {
+        active--;
+      }
+    }
+    syncManagerModule.SyncManager.prototype.push = function (this: unknown) {
+      return instrumented.call(this, () => originalPush.call(this));
+    };
+    syncManagerModule.SyncManager.prototype.pull = function (this: unknown) {
+      return instrumented.call(this, () => originalPull.call(this));
+    };
+
+    try {
+      await Promise.all([
+        onMessage({ type: 'push' }),
+        onMessage({ type: 'push' }),
+        onMessage({ type: 'pull' }),
+      ]);
+      assert.strictEqual(maxActive, 1, 'two sync operations ran concurrently against the same repo');
+    } finally {
+      syncManagerModule.SyncManager.prototype.push = originalPush;
+      syncManagerModule.SyncManager.prototype.pull = originalPull;
+    }
   });
 });

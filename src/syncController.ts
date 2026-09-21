@@ -108,6 +108,9 @@ export class SyncController {
   }
 
   async updateSetting(key: string, value: unknown): Promise<void> {
+    if (key === 'syncRemoteUrl' && typeof value === 'string') {
+      value = dedupeIfSelfConcatenated(value);
+    }
     await vscode.workspace.getConfiguration('opencodeSessionHub').update(key, value, vscode.ConfigurationTarget.Global);
     // Settings like the remote URL flip unconfigured -> idle immediately,
     // so the dashboard doesn't need a manual refresh after Save.
@@ -137,7 +140,35 @@ export class SyncController {
     this.output.appendLine(`[${new Date().toISOString()}] ${line}`);
   }
 
+  /**
+   * Serializes every operation that touches the sync repo's working
+   * directory (push, pull, resolveConflicts, status) through one queue.
+   * Without this, a debounced auto-push firing while a manual push is
+   * still running (or two rapid clicks) starts two SyncManager instances
+   * against the exact same repoDir concurrently — one's `git add`/commit
+   * can end up reading a file the other is still writing mid-mutation.
+   * That's exactly how a real report got "git add -A failed: fatal:
+   * confused by unstable object source data": git detected a file's
+   * content change while it was still hashing it. Queueing costs nothing
+   * in the common case (nothing else is ever running) and just makes a
+   * second call wait its turn instead of racing the first.
+   */
+  private syncQueue: Promise<void> = Promise.resolve();
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.syncQueue.then(task, task);
+    this.syncQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
   async sync(direction: 'push' | 'pull', options: { silent?: boolean } = {}): Promise<SyncOutcome | undefined> {
+    return this.enqueue(() => this.syncNow(direction, options));
+  }
+
+  private async syncNow(direction: 'push' | 'pull', options: { silent?: boolean } = {}): Promise<SyncOutcome | undefined> {
     const settings = this.getSettings();
     if (!settings.remoteUrl) {
       this.setState({ status: 'unconfigured' });
@@ -179,6 +210,10 @@ export class SyncController {
   }
 
   async refreshStatus(): Promise<SyncRepoStatus | undefined> {
+    return this.enqueue(() => this.refreshStatusNow());
+  }
+
+  private async refreshStatusNow(): Promise<SyncRepoStatus | undefined> {
     const settings = this.getSettings();
     if (!settings.remoteUrl) {
       this.setState({ status: 'unconfigured', repoStatus: undefined });
@@ -197,6 +232,10 @@ export class SyncController {
   }
 
   async resolveConflicts(keep: 'local' | 'remote'): Promise<SyncOutcome> {
+    return this.enqueue(() => this.resolveConflictsNow(keep));
+  }
+
+  private async resolveConflictsNow(keep: 'local' | 'remote'): Promise<SyncOutcome> {
     const outcome = await new SyncManager(this.getLocations(), this.getSettings()).resolveConflicts(keep);
     this.setState({ status: 'idle', lastOutcome: outcome, lastSyncAt: Date.now() });
     return outcome;
@@ -218,4 +257,28 @@ export class SyncController {
   async compactDatabase(): Promise<VacuumResult> {
     return vacuumDatabase(this.getLocations().databasePath);
   }
+}
+
+/**
+ * Catches the exact real-world failure of pasting a URL into the Remote URL
+ * field when it already contained the same value, producing something like
+ * "https://github.com/x/yhttps://github.com/x/y" — a string with no
+ * separator, so it looks nothing like a valid git URL and every fetch/push
+ * fails against it (indefinitely, if git ends up retrying or waiting on a
+ * credential prompt for a host that can't resolve), which reads as "stuck
+ * syncing forever" rather than a clear error naming the bad URL. Detected by
+ * splitting the trimmed string exactly in half and checking both halves are
+ * identical — deliberately narrow (an accidental exact self-paste) rather
+ * than a general URL validator, so it can never reject a URL that's simply
+ * unusual without also being sure it's this specific mistake.
+ */
+function dedupeIfSelfConcatenated(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length % 2 !== 0) {
+    return trimmed;
+  }
+  const half = trimmed.length / 2;
+  const first = trimmed.slice(0, half);
+  const second = trimmed.slice(half);
+  return first === second ? first : trimmed;
 }
