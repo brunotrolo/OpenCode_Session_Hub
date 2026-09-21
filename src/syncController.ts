@@ -125,7 +125,12 @@ export class SyncController {
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = undefined;
-      void this.sync('push', { silent: true });
+      // sync() rejects on failure, and nothing awaits an auto-push — without
+      // catching here a failed background sync becomes an unhandled promise
+      // rejection instead of something the user can actually see. syncNow()
+      // has already logged it and put the controller into the error state;
+      // this just keeps the rejection from escaping.
+      this.sync('push', { silent: true }).catch(() => undefined);
     }, Math.max(1, seconds) * 1000);
   }
 

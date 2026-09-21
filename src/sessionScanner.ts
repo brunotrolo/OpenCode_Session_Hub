@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { OpenCodeLocations } from './opencodePaths';
 import { deleteSessionRows } from './dbMaintenance';
+import { markSessionDeleted } from './deletedSessions';
 
 export interface SessionMessage {
   id: string;
@@ -78,13 +79,18 @@ export function loadMessages(locations: OpenCodeLocations, record: SessionRecord
 
 /**
  * Permanently removes a session's own files from this machine's OpenCode
- * storage. This only ever touches the local copy — sync repo history and
- * any other machine's copy are untouched, since deleting a session locally
- * is not itself something the sync plan is asked to propagate (session
- * directories merge rather than mirror precisely so an incomplete local
- * state can't wipe another machine's history).
+ * storage, and records a tombstone so the deletion sticks across syncs.
+ * Session JSON directories still merge rather than mirror (so an incomplete
+ * local state can't wipe another machine's history) — the tombstone is what
+ * distinguishes "this session is deliberately gone" from "this machine
+ * simply doesn't have it yet", which merging alone cannot tell apart.
  */
 export async function deleteSession(locations: OpenCodeLocations, record: SessionRecord): Promise<void> {
+  // Recorded before the delete itself, and on every delete path, because a
+  // session that reached the sync repo as its own export file is merged
+  // straight back on the next pull without it — see deletedSessions.ts.
+  markSessionDeleted(locations, record.id);
+
   switch (record.source) {
     case 'sqlite':
       await deleteSqliteSession(locations.databasePath, record.id);

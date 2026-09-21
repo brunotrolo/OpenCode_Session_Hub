@@ -111,10 +111,20 @@ export interface SyncPlanOptions {
   includeAgentsDir: boolean;
 }
 
-// 'opencode-session-hub-favorites.json' (see favorites.ts) rides along here
-// unconditionally, same as AGENTS.md — it's just labels + session ids, not
-// secret data, so it syncs regardless of the includeSecrets gate.
-const CONFIG_FILES = ['opencode.json', 'opencode.jsonc', 'AGENTS.md', 'opencode-session-hub-favorites.json'];
+// 'opencode-session-hub-favorites.json' (see favorites.ts) and
+// 'opencode-session-hub-deleted-sessions.json' (see deletedSessions.ts) ride
+// along here unconditionally, same as AGENTS.md — both are just session ids
+// plus labels/timestamps, not secret data, so they sync regardless of the
+// includeSecrets gate. The tombstone file in particular MUST sync: it is
+// what stops a session deleted on one machine from being re-seeded by
+// another machine that still holds its per-session export.
+const CONFIG_FILES = [
+  'opencode.json',
+  'opencode.jsonc',
+  'AGENTS.md',
+  'opencode-session-hub-favorites.json',
+  'opencode-session-hub-deleted-sessions.json',
+];
 const CONFIG_DIRS = [
   'agent',
   'agents',

@@ -2,13 +2,15 @@ import { spawn } from 'child_process';
 import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { mergeSessionDatabases } from './dbMerge';
+import { mergeManySessionDatabases, mergeSessionDatabases } from './dbMerge';
 import { exportFavoriteSessionFile } from './favoriteSessionExport';
+import { loadDeletedSessions } from './deletedSessions';
 import { loadFavorites } from './favorites';
 import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
 import { sanitizeMcpSecretsInConfigText } from './mcpSecretGuard';
 import { buildSyncPlan, OpenCodeLocations, SESSION_DB_REPO_PATH, SyncItem } from './opencodePaths';
 import { sanitizeJsonFile } from './secretSanitizer';
+import { deleteSession, scanSessions } from './sessionScanner';
 
 export type SyncStatus = 'idle' | 'syncing' | 'error' | 'unconfigured' | 'conflict';
 
@@ -298,15 +300,16 @@ export class SyncManager {
       return { status: 'conflict', messages: [...messages, CONFLICT_HINT], changedFiles: 0 };
     }
 
-    messages.push(...(await this.mirrorToRepo(items)));
+    const mirrored = await this.mirrorToRepo(items);
+    messages.push(...mirrored.messages);
 
     // Independent of the whole-database sync above (which the oversized-file
-    // skip can leave permanently stuck): each favorited session is exported
-    // to its own small file, keyed by session id, so a bookmark still gets
-    // across even when the full opencode.db never can. One favorite failing
-    // to export never blocks any other — see mirrorFavoriteSessions.
-    if (secretsAllowed) {
-      messages.push(...(await this.mirrorFavoriteSessions()));
+    // skip can leave permanently stuck): sessions are exported to their own
+    // small files, keyed by session id, so history still gets across even
+    // when the full opencode.db never can. One session failing to export
+    // never blocks any other — see mirrorFavoriteSessions.
+    if (secretsAllowed && this.settings.includeSessions) {
+      messages.push(...(await this.mirrorFavoriteSessions(mirrored.databaseSkipped)));
     }
 
     await this.gitAddAllWithRetry();
@@ -444,8 +447,48 @@ export class SyncManager {
       favoriteCount = favoriteApplied.count;
     }
 
-    const count = applied.count + favoriteCount;
+    const removed = await this.applyDeletedSessions();
+    messages.push(...removed.messages);
+
+    const count = applied.count + favoriteCount + removed.count;
     return { status: count > 0 ? 'ok' : 'no-changes', messages, changedFiles: count };
+  }
+
+  /**
+   * Carries out, locally, the deletions other machines recorded — the
+   * tombstone file arrives with the rest of the config, and this is what
+   * makes it mean something here.
+   *
+   * Skipping this would leave the deletion half-applied: this machine keeps
+   * the session in its own opencode.db, and because the whole-database
+   * mirror carries every row it holds, the very next push puts that session
+   * straight back into the sync repo. The machine that deleted it then pulls
+   * it back, and the deletion bounces between the two forever. Deleting it
+   * here is what stops that loop, and it's also simply what the user asked
+   * for when they deleted the session on the other machine.
+   */
+  private async applyDeletedSessions(): Promise<{ count: number; messages: string[] }> {
+    const tombstoned = new Set(loadDeletedSessions(this.locations).map((entry) => entry.sessionId));
+    if (tombstoned.size === 0) {
+      return { count: 0, messages: [] };
+    }
+
+    const messages: string[] = [];
+    let count = 0;
+    for (const record of scanSessions(this.locations).sessions) {
+      if (!tombstoned.has(record.id)) {
+        continue;
+      }
+      try {
+        await deleteSession(this.locations, record);
+        count += 1;
+      } catch (err) {
+        messages.push(
+          `Could not remove session ${record.id}, deleted on another machine: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    return { count, messages };
   }
 
   /**
@@ -457,32 +500,76 @@ export class SyncManager {
    * some other reason. Each file is independent: one failing produces one
    * skip message and never stops the rest from syncing.
    */
-  private async mirrorFavoriteSessions(): Promise<string[]> {
+  private async mirrorFavoriteSessions(databaseSkipped: boolean): Promise<string[]> {
     const favorites = loadFavorites(this.locations);
-    if (favorites.length === 0) {
-      return [];
+    const targets = new Map<string, string>();
+    for (const favorite of favorites) {
+      targets.set(favorite.sessionId, favorite.label);
     }
 
+    // When the whole-database sync was skipped (oversized, or OpenCode is
+    // holding uncheckpointed writes), per-session export is the ONLY route
+    // session history has to the remote — so it can't stay limited to what
+    // the user happened to bookmark. Without this, the real production case
+    // (a multi-GB opencode.db that never successfully compacts) syncs config
+    // forever while not a single session ever reaches GitHub, reporting
+    // success the whole time. Newest sessions first, bounded, so one push
+    // can't turn into thousands of exports.
     const messages: string[] = [];
+    if (databaseSkipped) {
+      // scanSessions already sorts newest-updated first.
+      const sqliteSessions = scanSessions(this.locations).sessions.filter((session) => session.source === 'sqlite');
+      for (const session of sqliteSessions.slice(0, MAX_INDIVIDUAL_SESSION_EXPORTS)) {
+        if (!targets.has(session.id)) {
+          targets.set(session.id, session.title);
+        }
+      }
+      if (sqliteSessions.length > MAX_INDIVIDUAL_SESSION_EXPORTS) {
+        messages.push(
+          'opencode.db could not be synced as a whole, so sessions are being synced individually — the ' +
+            `${MAX_INDIVIDUAL_SESSION_EXPORTS} most recently updated of ${sqliteSessions.length} were included. ` +
+            'Favorite any older session you want carried across; favorites are always synced regardless of this limit.'
+        );
+      }
+    }
+
     const destDir = path.join(this.repoDir, ...FAVORITE_SESSIONS_REPO_DIR.split('/'));
+
+    // A session deleted on this machine must also leave the mirror, or its
+    // still-present export file re-seeds it here on the next pull and onto
+    // every other machine too. Removing the file is what makes a deletion
+    // actually propagate instead of silently reversing itself — so this runs
+    // before the "nothing to export" bail-out below: deleting the last
+    // session leaves nothing to export and still has to remove its file.
+    const deleted = loadDeletedSessions(this.locations);
+    if (deleted.length > 0 && (await exists(destDir))) {
+      for (const entry of deleted) {
+        targets.delete(entry.sessionId);
+        await fs.rm(path.join(destDir, `${entry.sessionId}.db`), { force: true }).catch(() => undefined);
+      }
+    }
+
+    if (targets.size === 0) {
+      return messages;
+    }
+
     await fs.mkdir(destDir, { recursive: true });
 
-    for (const favorite of favorites) {
-      const outputPath = path.join(destDir, `${favorite.sessionId}.db`);
-      const result = await exportFavoriteSessionFile(this.locations.databasePath, favorite.sessionId, outputPath);
+    for (const [sessionId, label] of targets) {
+      const outputPath = path.join(destDir, `${sessionId}.db`);
+      const result = await exportFavoriteSessionFile(this.locations.databasePath, sessionId, outputPath);
       if (!result.ok) {
-        messages.push(`Favorite session "${favorite.label}" (${favorite.sessionId}) not synced: ${result.error}`);
+        messages.push(`Session "${label}" (${sessionId}) not synced: ${result.error}`);
         continue;
       }
 
-      // A favorited session is still just one session's worth of messages,
-      // so this should essentially never fire — but a runaway single
-      // session (huge tool output, say) is exactly the kind of thing this
-      // whole feature exists to route around, not reproduce.
+      // One session's worth of messages should essentially never hit this —
+      // but a runaway single session (huge tool output, say) is exactly the
+      // kind of thing this whole feature exists to route around, not repeat.
       const oversized = await this.checkOversizedFile(outputPath);
       if (oversized) {
         await fs.rm(outputPath, { force: true });
-        messages.push(`Favorite session "${favorite.label}" (${favorite.sessionId}) not synced: ${oversized}`);
+        messages.push(`Session "${label}" (${sessionId}) not synced: ${oversized}`);
       }
     }
 
@@ -504,30 +591,48 @@ export class SyncManager {
     const messages: string[] = [];
     let count = 0;
 
+    // A session this machine deleted keeps its tombstone forever, so even if
+    // another machine (or an older commit) still carries an export file for
+    // it, it is never merged back in here — see deletedSessions.ts.
+    const deletedIds = new Set(loadDeletedSessions(this.locations).map((entry) => entry.sessionId));
+
+    const sourcePaths: string[] = [];
     for (const entry of await readDirEntries(dir)) {
-      if (!entry.isFile() || !entry.name.endsWith('.db')) {
-        continue;
+      if (entry.isFile() && entry.name.endsWith('.db') && !deletedIds.has(entry.name.replace(/\.db$/, ''))) {
+        sourcePaths.push(path.join(dir, entry.name));
       }
-      const sourcePath = path.join(dir, entry.name);
+    }
+    if (sourcePaths.length === 0) {
+      return { count: 0, messages };
+    }
 
-      try {
-        if (!(await exists(this.locations.databasePath))) {
-          await fs.mkdir(path.dirname(this.locations.databasePath), { recursive: true });
-          await fs.copyFile(sourcePath, this.locations.databasePath);
-          count += 1;
-          continue;
-        }
+    // A genuinely fresh machine has no opencode.db for the merge to write
+    // into (mergeTable needs the target's tables to already exist), so the
+    // first export bootstraps it by plain copy and the rest merge into that.
+    if (!(await exists(this.locations.databasePath))) {
+      await fs.mkdir(path.dirname(this.locations.databasePath), { recursive: true });
+      await fs.copyFile(sourcePaths[0], this.locations.databasePath);
+      count += 1;
+      sourcePaths.shift();
+      if (sourcePaths.length === 0) {
+        return { count, messages };
+      }
+    }
 
-        const merged = mergeSessionDatabases(this.locations.databasePath, sourcePath);
-        if (merged === null) {
-          messages.push(`Could not apply favorite session file ${entry.name}: node:sqlite unavailable or the file is unreadable.`);
-        } else if (merged > 0) {
-          count += 1;
-        }
-      } catch (err) {
-        messages.push(
-          `Could not apply favorite session file ${entry.name}: ${err instanceof Error ? err.message : String(err)}`
-        );
+    // One target connection for every export file — see
+    // mergeManySessionDatabases on why merging them one-connection-per-file
+    // stalls the extension host on a large opencode.db.
+    const results = mergeManySessionDatabases(this.locations.databasePath, sourcePaths);
+    if (results === null) {
+      messages.push('Could not apply synced session files: node:sqlite unavailable or opencode.db is unreadable.');
+      return { count, messages };
+    }
+
+    for (const result of results) {
+      if (result.changed === null) {
+        messages.push(`Could not apply synced session file ${path.basename(result.path)}: it is unreadable.`);
+      } else if (result.changed > 0) {
+        count += 1;
       }
     }
 
@@ -696,8 +801,9 @@ export class SyncManager {
 
   // --------------------------------------------------------------- mirror ---
 
-  private async mirrorToRepo(items: SyncItem[]): Promise<string[]> {
+  private async mirrorToRepo(items: SyncItem[]): Promise<{ messages: string[]; databaseSkipped: boolean }> {
     const messages: string[] = [];
+    let databaseSkipped = false;
 
     for (const item of items) {
       const destination = path.join(this.repoDir, ...item.repoPath.split('/'));
@@ -707,6 +813,9 @@ export class SyncManager {
 
       if (item.type === 'file') {
         if (await this.isVolatile(item.localPath)) {
+          if (item.repoPath === SESSION_DB_REPO_PATH) {
+            databaseSkipped = true;
+          }
           messages.push(
             `Skipped ${path.basename(item.localPath)}: uncheckpointed SQLite writes (-wal) are present. Close OpenCode and sync again.`
           );
@@ -715,6 +824,9 @@ export class SyncManager {
 
         const oversized = await this.checkOversizedFile(item.localPath);
         if (oversized) {
+          if (item.repoPath === SESSION_DB_REPO_PATH) {
+            databaseSkipped = true;
+          }
           messages.push(oversized);
           continue;
         }
@@ -744,7 +856,7 @@ export class SyncManager {
       messages.push(...(await this.copyTree(item.localPath, destination, item.isSecret, !item.isSecret)));
     }
 
-    return messages;
+    return { messages, databaseSkipped };
   }
 
   private async applyFromRepo(items: SyncItem[]): Promise<{ count: number; messages: string[] }> {
@@ -1031,8 +1143,9 @@ export class SyncManager {
     return (
       `Skipped ${path.basename(filePath)}: ${actualMb} MB exceeds the ${limitMb} MB sync limit ` +
       '(GitHub rejects any single file over 100 MB, and git would spend real time hashing it first). ' +
-      'If this is opencode.db, close OpenCode and run "Compact Database…" from the sidebar (or ' +
-      '"OpenCode Sync: Compact Database (VACUUM)") to shrink it, then sync again.'
+      'If this is opencode.db, sessions are still being synced individually one file per session, so your ' +
+      'history does reach the remote — but to sync the database as a whole again, close OpenCode and run ' +
+      '"Compact Database…" from the sidebar (or "OpenCode Sync: Compact Database (VACUUM)") to shrink it.'
     );
   }
 
@@ -1132,6 +1245,15 @@ const OVERSIZED_FILE_SKIP_BYTES = 90 * 1024 * 1024;
 
 /** Where per-session favorite exports live in the mirror, one file per session id — see mirrorFavoriteSessions/applyFavoriteSessions. */
 const FAVORITE_SESSIONS_REPO_DIR = 'data/favorite-sessions';
+
+/**
+ * Cap on how many sessions one push exports individually when the whole
+ * database can't sync. High enough to cover a real machine's working set
+ * (the reported one has ~150), bounded so a machine with thousands of
+ * sessions doesn't turn every push into thousands of SQLite exports.
+ * Favorites are always exported and never counted against this.
+ */
+const MAX_INDIVIDUAL_SESSION_EXPORTS = 200;
 
 /** Bounds inspectOversizedUnpushedHistory's scan so a very long unpushed history can't turn every push into a slow full scan. */
 const MAX_HISTORY_SCAN_COMMITS = 100;

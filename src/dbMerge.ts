@@ -80,6 +80,78 @@ export function mergeSessionDatabases(targetPath: string, sourcePath: string): n
   }
 }
 
+/**
+ * Merges many source databases into one target in a SINGLE target
+ * connection. Calling mergeSessionDatabases() in a loop instead reopens and
+ * recloses the target once per source — and on OpenCode's real multi-GB
+ * opencode.db each close triggers a WAL checkpoint, so merging a few hundred
+ * per-session export files that way turns a pull into a long synchronous
+ * stall of the whole extension host. Returns per-source results in the same
+ * order as `sourcePaths`, so one unreadable export still reports individually
+ * without failing the rest, or `null` if the target itself can't be opened.
+ */
+export function mergeManySessionDatabases(
+  targetPath: string,
+  sourcePaths: string[]
+): { path: string; changed: number | null }[] | null {
+  let DatabaseSync: new (p: string, o?: Record<string, unknown>) => SqliteHandle;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return null;
+  }
+
+  let target: SqliteHandle | undefined;
+  try {
+    target = new DatabaseSync(targetPath);
+  } catch {
+    return null;
+  }
+
+  const results: { path: string; changed: number | null }[] = [];
+  try {
+    for (const sourcePath of sourcePaths) {
+      let source: SqliteHandle | undefined;
+      try {
+        source = new DatabaseSync(sourcePath, { readOnly: true });
+        let changed = 0;
+        target.exec('BEGIN;');
+        try {
+          for (const table of MERGE_TABLES) {
+            changed += mergeTable(target, source, table);
+          }
+          target.exec('COMMIT;');
+        } catch (err) {
+          try {
+            target.exec('ROLLBACK;');
+          } catch {
+            // Best-effort: if rollback itself fails the connection is already in a bad state.
+          }
+          throw err;
+        }
+        results.push({ path: sourcePath, changed });
+      } catch {
+        results.push({ path: sourcePath, changed: null });
+      } finally {
+        try {
+          source?.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  } finally {
+    try {
+      target.close();
+    } catch {
+      // ignore
+    }
+  }
+
+  return results;
+}
+
 function mergeTable(target: SqliteHandle, source: SqliteHandle, table: string): number {
   let targetColumns: string[];
   let sourceColumns: string[];
