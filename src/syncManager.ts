@@ -5,6 +5,8 @@ import * as path from 'path';
 import { mergeSessionDatabases } from './dbMerge';
 import { exportFavoriteSessionFile } from './favoriteSessionExport';
 import { loadFavorites } from './favorites';
+import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
+import { sanitizeMcpSecretsInConfigText } from './mcpSecretGuard';
 import { buildSyncPlan, OpenCodeLocations, SESSION_DB_REPO_PATH, SyncItem } from './opencodePaths';
 import { sanitizeJsonFile } from './secretSanitizer';
 
@@ -65,9 +67,9 @@ export class SyncManager {
    * explicitly acknowledged as private. Upstream opencode-synced fails closed
    * the same way, because a public sync repo would publish whole transcripts.
    */
-  private effectivePlan(): { items: SyncItem[]; messages: string[] } {
+  private async effectivePlan(): Promise<{ items: SyncItem[]; messages: string[]; secretsAllowed: boolean }> {
     const messages: string[] = [];
-    const secretsAllowed = this.settings.includeSecrets && this.settings.privateRepoAcknowledged;
+    const secretsAllowed = await this.resolveSecretsAllowed(messages);
 
     if (this.settings.includeSessions && !secretsAllowed) {
       messages.push(
@@ -83,7 +85,35 @@ export class SyncManager {
       includeAgentsDir: this.settings.includeAgentsDir,
     });
 
-    return { items, messages };
+    return { items, messages, secretsAllowed };
+  }
+
+  /**
+   * The base check is the same honor-system checkbox as always
+   * (includeSecrets + privateRepoAcknowledged). Where the remote is a
+   * github.com repo and the `gh` CLI is available and authenticated, this
+   * additionally verifies that claim against GitHub itself — catching the
+   * real mistake of checking that box for a repo that's actually public.
+   * Never loosens the gate: if `gh` can't verify one way or the other
+   * (not installed, not authenticated, network down), the manual checkbox
+   * alone still governs, exactly as it always has.
+   */
+  private async resolveSecretsAllowed(messages: string[]): Promise<boolean> {
+    const acknowledged = this.settings.includeSecrets && this.settings.privateRepoAcknowledged;
+    if (!acknowledged || !this.settings.remoteUrl) {
+      return acknowledged;
+    }
+
+    const check = await checkGitHubRepoPrivacy(this.settings.remoteUrl);
+    if (check.checked && !check.isPrivate) {
+      messages.push(
+        'Secrets/session history were NOT synced: GitHub reports this repository is PUBLIC, despite ' +
+          '"I confirmed the remote repo is PRIVATE" being checked. Make the repository private on GitHub, or ' +
+          'point opencodeSessionHub.syncRemoteUrl at a different one, then sync again.'
+      );
+      return false;
+    }
+    return acknowledged;
   }
 
   async ensureRepo(): Promise<void> {
@@ -260,7 +290,7 @@ export class SyncManager {
 
   async push(): Promise<SyncOutcome> {
     await this.ensureRepo();
-    const { items, messages } = this.effectivePlan();
+    const { items, messages, secretsAllowed } = await this.effectivePlan();
 
     const integration = await this.fetchAndIntegrate();
     messages.push(...integration.messages);
@@ -275,7 +305,7 @@ export class SyncManager {
     // to its own small file, keyed by session id, so a bookmark still gets
     // across even when the full opencode.db never can. One favorite failing
     // to export never blocks any other — see mirrorFavoriteSessions.
-    if (this.settings.includeSecrets && this.settings.privateRepoAcknowledged) {
+    if (secretsAllowed) {
       messages.push(...(await this.mirrorFavoriteSessions()));
     }
 
@@ -293,6 +323,25 @@ export class SyncManager {
     const ahead = await this.commitsAheadOfOrigin();
     if (!staged && ahead === 0) {
       return { status: 'no-changes', messages, changedFiles: 0 };
+    }
+
+    // Catches a file that was already committed to this repo's history
+    // before OVERSIZED_FILE_SKIP_BYTES existed (or by some other means) —
+    // that guard only stops a NEW oversized file from being added, it does
+    // nothing about one already sitting in an unpushed commit. Checking
+    // first avoids a slow, doomed upload attempt (GitHub rejects it anyway)
+    // and — since the commit is already made — gives the one piece of
+    // information git's own rejection doesn't: which unpushed commits carry
+    // it and that history itself needs fixing, not just the working tree.
+    const oversizedHistory = await this.inspectOversizedUnpushedHistory();
+    if (oversizedHistory.oversizedPaths.length > 0) {
+      throw new SyncError(
+        `Refusing to push: ${oversizedHistory.unpushedCommits} unpushed commit(s) already contain file(s) over ` +
+          `GitHub's size limit: ${oversizedHistory.oversizedPaths.join(', ')}. This predates the current ` +
+          "oversized-file skip, or came from something else entirely. Fix it with 'git filter-repo' (or " +
+          `BFG Repo-Cleaner) in ${this.repoDir} to remove it from history, or reset the local mirror and let the ` +
+          'next push rebuild it clean (only safe if no other machine needs this history).'
+      );
     }
 
     await this.git(['push', '-u', 'origin', this.settings.branch]);
@@ -319,13 +368,65 @@ export class SyncManager {
   }
 
   /**
+   * Adapted from opencode-synced's inspectOversizedUnpushedHistory (its
+   * repo.ts). Scans commits about to be pushed (origin/<branch>..HEAD, or
+   * every local commit if the branch has no remote yet) for any blob over
+   * the sync size limit, via `git ls-tree -r -l` on each revision's full
+   * tree. Bounded to MAX_HISTORY_SCAN_COMMITS so a very long unpushed
+   * history doesn't turn every push into a slow full scan — past that, this
+   * gives up and reports nothing found rather than blocking indefinitely
+   * (git's own push will still surface GitHub's rejection in that case, just
+   * without this extra context).
+   */
+  private async inspectOversizedUnpushedHistory(): Promise<{ oversizedPaths: string[]; unpushedCommits: number }> {
+    if ((await this.git(['rev-parse', '--verify', 'HEAD'], { allowFailure: true })).code !== 0) {
+      return { oversizedPaths: [], unpushedCommits: 0 };
+    }
+
+    const remoteExists =
+      (await this.git(['rev-parse', '--verify', `origin/${this.settings.branch}`], { allowFailure: true })).code === 0;
+    const revListArgs = remoteExists
+      ? ['rev-list', `--max-count=${MAX_HISTORY_SCAN_COMMITS + 1}`, `origin/${this.settings.branch}..HEAD`]
+      : ['rev-list', `--max-count=${MAX_HISTORY_SCAN_COMMITS + 1}`, 'HEAD', '--not', '--remotes=origin'];
+    const revListResult = await this.git(revListArgs, { allowFailure: true });
+    const revisions = revListResult.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (revisions.length === 0 || revisions.length > MAX_HISTORY_SCAN_COMMITS) {
+      return { oversizedPaths: [], unpushedCommits: revisions.length };
+    }
+
+    const oversizedPaths = new Set<string>();
+    for (const revision of revisions) {
+      const treeResult = await this.git(['ls-tree', '-r', '-l', '--full-tree', revision], { allowFailure: true });
+      if (treeResult.code !== 0) {
+        continue;
+      }
+      for (const line of treeResult.stdout.split('\n')) {
+        const match = line.match(/^\d+\s+blob\s+[0-9a-f]+\s+(\d+)\t(.+)$/);
+        if (!match) {
+          continue;
+        }
+        const size = Number(match[1]);
+        if (Number.isFinite(size) && size > OVERSIZED_FILE_SKIP_BYTES) {
+          oversizedPaths.add(match[2]);
+        }
+      }
+    }
+
+    return { oversizedPaths: [...oversizedPaths].sort(), unpushedCommits: revisions.length };
+  }
+
+  /**
    * Pulls the sync repo AND applies it to the local OpenCode directories.
    * Without the apply step, arriving at the other machine downloads nothing
    * OpenCode can actually read.
    */
   async pull(): Promise<SyncOutcome> {
     await this.ensureRepo();
-    const { items, messages } = this.effectivePlan();
+    const { items, messages, secretsAllowed } = await this.effectivePlan();
 
     const integration = await this.fetchAndIntegrate();
     messages.push(...integration.messages);
@@ -337,7 +438,7 @@ export class SyncManager {
     messages.push(...applied.messages);
 
     let favoriteCount = 0;
-    if (this.settings.includeSecrets && this.settings.privateRepoAcknowledged) {
+    if (secretsAllowed) {
       const favoriteApplied = await this.applyFavoriteSessions();
       messages.push(...favoriteApplied.messages);
       favoriteCount = favoriteApplied.count;
@@ -475,7 +576,7 @@ export class SyncManager {
       messages.push(`Resolved ${conflicted.length} conflicted file(s), keeping the ${keep} version.`);
     }
 
-    const { items } = this.effectivePlan();
+    const { items } = await this.effectivePlan();
     const applied = await this.applyFromRepo(items);
     messages.push(...applied.messages);
 
@@ -576,7 +677,7 @@ export class SyncManager {
    */
   private async oversizedFileSummary(): Promise<string> {
     const limitMb = OVERSIZED_FILE_SKIP_BYTES / (1024 * 1024);
-    const { items } = this.effectivePlan();
+    const { items } = await this.effectivePlan();
     const oversized: string[] = [];
     for (const item of items) {
       if (item.type !== 'file') {
@@ -801,6 +902,7 @@ export class SyncManager {
   private async copyFile(source: string, destination: string, isSecret: boolean): Promise<string | undefined> {
     await fs.mkdir(path.dirname(destination), { recursive: true });
 
+    let mcpSecretsRedacted = 0;
     const attempt = async () => {
       // Redaction only ever touches session artifacts. Rewriting a config
       // file would push a broken opencode.json the other machine applies.
@@ -808,6 +910,28 @@ export class SyncManager {
         await fs.writeFile(destination, sanitizeJsonFile(await fs.readFile(source, 'utf8')), 'utf8');
         return;
       }
+
+      // opencode.json/opencode.jsonc sync unconditionally (they're not
+      // gated behind includeSecrets) but can hold real MCP server
+      // credentials in mcp.*.headers/oauth — today those would otherwise
+      // reach the sync repo in plaintext regardless of the secrets gate.
+      // Unlike the blanket redaction above, this only swaps known
+      // credential fields for OpenCode's own `{env:VAR}` placeholder
+      // syntax — valid, meaningful JSON, not lossy — so the file this
+      // writes is still one OpenCode can load (once the matching env var
+      // is set), it just never puts the raw value in git history.
+      const baseName = path.basename(source);
+      if (baseName === 'opencode.json' || baseName === 'opencode.jsonc') {
+        const sanitizedResult = sanitizeMcpSecretsInConfigText(await fs.readFile(source, 'utf8'));
+        if (sanitizedResult) {
+          mcpSecretsRedacted = sanitizedResult.redactedCount;
+          await fs.writeFile(destination, sanitizedResult.content, 'utf8');
+          return;
+        }
+        // Not parseable as plain JSON (e.g. .jsonc with comments) — fall
+        // through to a plain copy rather than risk corrupting it.
+      }
+
       await fs.copyFile(source, destination);
     };
 
@@ -819,7 +943,9 @@ export class SyncManager {
       }
       try {
         await attempt();
-        return undefined;
+        return mcpSecretsRedacted > 0
+          ? `Replaced ${mcpSecretsRedacted} MCP credential(s) in ${path.basename(source)} with {env:VAR} placeholders before committing.`
+          : undefined;
       } catch (err) {
         lastError = err;
       }
@@ -963,6 +1089,9 @@ const OVERSIZED_FILE_SKIP_BYTES = 90 * 1024 * 1024;
 
 /** Where per-session favorite exports live in the mirror, one file per session id — see mirrorFavoriteSessions/applyFavoriteSessions. */
 const FAVORITE_SESSIONS_REPO_DIR = 'data/favorite-sessions';
+
+/** Bounds inspectOversizedUnpushedHistory's scan so a very long unpushed history can't turn every push into a slow full scan. */
+const MAX_HISTORY_SCAN_COMMITS = 100;
 
 /**
  * How long a `.git/index.lock` has to sit untouched before it's treated as

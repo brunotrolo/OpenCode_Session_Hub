@@ -525,6 +525,68 @@ describe('two-machine sync simulation', () => {
     assert.ok(bobSessions.includes('ses_real'));
   });
 
+  it('fails closed when GitHub itself reports the acknowledged-private repo is actually public', async () => {
+    // The "I confirmed the remote repo is PRIVATE" checkbox is an honor
+    // system — this proves that when `gh` is available and disagrees with
+    // it, the disagreement wins and secrets/sessions don't sync anyway.
+    // Stubs checkGitHubRepoPrivacy directly rather than spawning a real
+    // `gh` process, since CI/dev machines running this suite may not have
+    // it installed or authenticated.
+    const remote = path.join(root, 'actually-public-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
+    const machine = createMachine(root, 'actually-public');
+    addSqliteSession(machine, {
+      sessionId: 'ses_should_not_sync',
+      projectId: 'prj_pub',
+      title: 'Should not leave this machine',
+      directory: '/work/private',
+      updated: 1_700_000_000_000,
+    });
+
+    const visibilityModule = require('../githubRepoVisibility');
+    const original = visibilityModule.checkGitHubRepoPrivacy;
+    visibilityModule.checkGitHubRepoPrivacy = async () => ({ checked: true, isPrivate: false });
+
+    try {
+      const outcome = await managerFor(machine, { remoteUrl: remote }).push();
+      assert.ok(
+        outcome.messages.some((m) => m.includes('PUBLIC') && m.includes('NOT synced')),
+        outcome.messages.join(' | ')
+      );
+      assert.ok(
+        !fs.existsSync(path.join(machine.home, 'sync-repo', 'data', 'opencode.db')),
+        'session data must not reach the mirror when GitHub reports the repo public'
+      );
+    } finally {
+      visibilityModule.checkGitHubRepoPrivacy = original;
+    }
+  });
+
+  it('refuses to push when an unpushed commit already carries a file over the size limit', async () => {
+    // Simulates a file that got into the sync repo's history some other way
+    // (predates OVERSIZED_FILE_SKIP_BYTES, or a manual git operation) —
+    // this must be caught and explained clearly BEFORE attempting a push
+    // that GitHub would reject anyway, rather than a raw, unexplained git
+    // failure after a slow upload attempt.
+    const remote = path.join(root, 'oversized-history-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
+
+    const machine = createMachine(root, 'oversized-history');
+    const manager = managerFor(machine, { remoteUrl: remote });
+    await manager.ensureRepo();
+
+    const repoDir = path.join(machine.home, 'sync-repo');
+    fs.writeFileSync(path.join(repoDir, 'stray-large-file.bin'), Buffer.alloc(95 * 1024 * 1024, 1));
+    spawnSync('git', ['-C', repoDir, 'add', '-A']);
+    spawnSync('git', ['-C', repoDir, 'commit', '-m', 'oops, committed something huge']);
+
+    await assert.rejects(() => manager.push(), (err: Error) => {
+      assert.ok(err.message.includes('stray-large-file.bin'), err.message);
+      assert.ok(err.message.includes('unpushed commit'), err.message);
+      return true;
+    });
+  });
+
   it('exposes ahead/behind status', async () => {
     const status = await managerFor(work).status();
     assert.strictEqual(status.branch, 'main');

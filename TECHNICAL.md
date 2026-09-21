@@ -23,6 +23,54 @@ Reading `opencode.db` uses `node:sqlite`, which requires Node 22.5+. Older
 Node just skips SQLite sessions with a warning; JSON-layout sessions still
 list normally.
 
+## Ported from opencode-synced
+
+Three capabilities adapted from the upstream plugin (which runs *inside*
+OpenCode itself as a `@opencode-ai/plugin` — a fundamentally different
+runtime from this VS Code extension, so these are re-implementations, not
+direct ports):
+
+- **GitHub repo-privacy verification** (`githubRepoVisibility.ts`, adapted
+  from `repo.ts`'s `ensureRepoPrivate`): "I confirmed the remote repo is
+  PRIVATE" is an honor-system checkbox — a user can tick it for a repo
+  that's actually public by mistake. Where the remote is a `github.com`
+  URL and the `gh` CLI is installed and authenticated,
+  `resolveSecretsAllowed` (in `syncManager.ts`) verifies the claim via
+  `gh repo view --json isPrivate` before ever trusting it, and fails
+  closed (no secrets/session sync this round) if GitHub disagrees. Any
+  failure to check at all — `gh` missing, not authenticated, network down,
+  a non-GitHub remote, a timeout (capped at 8s so an unreachable `gh` can't
+  hang a sync) — falls back to the checkbox exactly as it always worked;
+  this can only make the gate stricter, never looser.
+- **Oversized-history detection** (`inspectOversizedUnpushedHistory` in
+  `syncManager.ts`, adapted from `repo.ts`'s
+  `inspectOversizedUnpushedHistory`): `OVERSIZED_FILE_SKIP_BYTES` only
+  stops a *new* oversized file from being added — it does nothing about one
+  that's already sitting in an unpushed commit (predating the guard, or
+  from some other means entirely). Before pushing, this scans
+  `origin/<branch>..HEAD` (via `git ls-tree -r -l` on each revision, capped
+  at `MAX_HISTORY_SCAN_COMMITS` so a long unpushed history can't slow down
+  every push) for any blob over the limit, and refuses the push with a
+  clear message naming the file and the remediation (`git filter-repo`, or
+  resetting the local mirror if no other machine needs that history) —
+  instead of a slow, doomed upload GitHub was always going to reject.
+- **MCP credential extraction** (`mcpSecretGuard.ts`, adapted from
+  `mcp-secrets.ts`): `opencode.json`/`.jsonc` sync unconditionally (they
+  aren't gated behind `includeSecrets`), so any real credential in
+  `mcp.*.headers`/`mcp.*.oauth.clientSecret` used to reach the sync repo in
+  plaintext regardless of the secrets gate. `copyFile` now runs this
+  specifically for those two filenames on push, swapping any such value for
+  OpenCode's own `{env:VAR}` placeholder syntax — valid, meaningful JSON,
+  not the lossy blanket redaction `sanitizeJsonFile` does elsewhere — before
+  the file reaches the repo. The local file this machine actually uses is
+  never touched. Falls back to a plain copy if the file isn't valid JSON
+  (e.g. `.jsonc` with comments), rather than risk corrupting it. Their
+  plugin also *restores* these at OpenCode's own config-load time; we have
+  no equivalent hook (we're external to OpenCode), so a machine receiving a
+  synced `opencode.json` needs the corresponding environment variable set
+  for that MCP server to keep working — the same trade-off using `{env:VAR}`
+  already implies for anyone relying on it today.
+
 ## What gets synced
 
 Mirrors [iHildy/opencode-synced](https://github.com/iHildy/opencode-synced)'s
