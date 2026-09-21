@@ -1066,9 +1066,16 @@ export class SyncManager {
    * tolerance already given to individual locked-file copies — gives that
    * external interference a chance to clear before treating it as a real
    * failure.
+   *
+   * A real report kept hitting this even with a first, shorter version of
+   * this retry (0/300/800ms, ~1.1s total) — too short a window for an AV
+   * scan of a large file (a multi-MB favorite-session export, say) to
+   * actually finish. Widened to ~15s total across more attempts, since the
+   * cost of waiting a bit longer on the rare case this fires is trivial
+   * next to failing the whole sync and making the user retry by hand.
    */
   private async gitAddAllWithRetry(): Promise<void> {
-    const delays = [0, 300, 800];
+    const delays = [0, 300, 800, 1500, 3000, 4000, 5000];
     let lastError: unknown;
     for (const delay of delays) {
       if (delay > 0) {

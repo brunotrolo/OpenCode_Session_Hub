@@ -207,10 +207,10 @@ Key safety properties, implemented in `syncManager.ts`:
   Defender's real-time scanner especially) or a sync client like OneDrive
   briefly opening a working-tree file at the moment git is hashing it makes
   git see the size change mid-read and refuse to trust it — not real
-  corruption, just a momentary external read race. A short retry (matching
-  the tolerance already given to individual locked-file copies) absorbs it;
-  any other `git add` failure surfaces immediately, never masked behind a
-  retry.
+  corruption, just a momentary external read race. Retried with backoff over
+  ~15s total (an initial short version — ~1.1s total — still wasn't enough
+  window for an AV scan of a large file to finish); any other `git add`
+  failure surfaces immediately, never masked behind a retry.
 - **Merge, not mirror, for session directories**: a file missing locally is
   never deleted from the repo, so one machine can't wipe another's history.
 - **Local-edit protection**: a file touched since this machine's last
