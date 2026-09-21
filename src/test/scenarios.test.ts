@@ -378,6 +378,82 @@ describe('real-world sync scenarios', () => {
     }
   });
 
+  it('runs the session export in a child process, off the extension host', async () => {
+    // node:sqlite is fully synchronous, so running a large export inline
+    // blocks the entire VS Code window — the same failure mode already fixed
+    // for VACUUM and for deleting a session, and the one the user reported
+    // as the extension freezing. Asserting on elapsed time is unreliable
+    // (the inline path awaits between sessions, and a warm page cache can
+    // make either run the faster one), so this asserts the mechanism: a
+    // child process is actually spawned, and the exports it produces are
+    // correct.
+    const machine = createMachine(root, 'offthread-export');
+    const dbPath = path.join(machine.dataRoot, 'opencode.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+               slug TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT,
+               time_created INTEGER, time_updated INTEGER)`);
+    db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+    db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+               time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+
+    const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)');
+    const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)');
+    db.exec('BEGIN;');
+    for (let s = 0; s < 8; s++) {
+      insertSession.run(`ses_${s}`, 'prj', null, 'slug', '/work', `Session ${s}`, '1.0', 1, 1);
+      for (let m = 0; m < 5; m++) {
+        insertMessage.run(`msg_${s}_${m}`, `ses_${s}`, 1, 1, '{}');
+        insertPart.run(`prt_${s}_${m}`, `msg_${s}_${m}`, `ses_${s}`, 1, 1, JSON.stringify({ type: 'text', text: `s${s}m${m}` }));
+      }
+    }
+    db.exec('COMMIT;');
+    db.close();
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const childProcess = require('child_process');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { exportSessionFilesOffThread } = require('../favoriteSessionExport');
+    const entries = Array.from({ length: 8 }, (_, s) => ({
+      sessionId: `ses_${s}`,
+      outputPath: path.join(machine.home, 'out', `ses_${s}.db`),
+    }));
+
+    const realSpawn = childProcess.spawn;
+    let spawned = 0;
+    childProcess.spawn = function patchedSpawn(this: unknown, ...args: unknown[]) {
+      spawned += 1;
+      return realSpawn.apply(this, args as never);
+    };
+
+    let results: { ok: boolean; sessionId: string }[];
+    try {
+      results = await exportSessionFilesOffThread(dbPath, entries);
+    } finally {
+      childProcess.spawn = realSpawn;
+    }
+
+    assert.strictEqual(spawned, 1, 'the export must run in a spawned child process, not on the extension host');
+    assert.ok(
+      results.every((r) => r.ok),
+      `every session should export: ${JSON.stringify(results.filter((r) => !r.ok))}`
+    );
+
+    // The child really wrote correct, separate files.
+    const exported = new DatabaseSync(path.join(machine.home, 'out', 'ses_3.db'), { readOnly: true });
+    try {
+      assert.strictEqual(String(exported.prepare('SELECT id FROM session').get().id), 'ses_3');
+      assert.strictEqual(Number(exported.prepare('SELECT COUNT(*) AS n FROM part').get().n), 5);
+    } finally {
+      exported.close();
+    }
+  });
+
+
   it('does not resurrect a locally deleted session on the next pull', async () => {
     // Now that a push can export every session individually, the remote
     // holds a per-session file for each one. Deleting a session locally and

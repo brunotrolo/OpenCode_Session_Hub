@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -59,6 +60,82 @@ export type BatchExportResult = { sessionId: string } & ExportResult;
  * order given, so one session failing to export never affects the others —
  * the same independence the one-file-per-session design exists for.
  */
+/**
+ * Runs exportSessionFilesBatched in a throwaway child process, falling back
+ * to running it inline if the child can't be started.
+ *
+ * node:sqlite is fully synchronous, so even the batched export blocks the
+ * entire extension host for as long as it runs — and on the multi-GB
+ * database this feature exists to work around, that is long enough to
+ * freeze the whole VS Code window on every push. The child writes the export
+ * files straight to disk, so only a small JSON summary crosses the process
+ * boundary. The worker requires THIS compiled module rather than
+ * reimplementing the export, so there is only ever one copy of the logic.
+ */
+export function exportSessionFilesOffThread(
+  databasePath: string,
+  entries: BatchExportEntry[]
+): Promise<BatchExportResult[]> {
+  if (entries.length === 0) {
+    return Promise.resolve([]);
+  }
+
+  const workerSource = `
+let input = '';
+process.stdin.on('data', (chunk) => (input += chunk));
+process.stdin.on('end', async () => {
+  try {
+    const { databasePath, entries } = JSON.parse(input);
+    const mod = require(${JSON.stringify(__filename)});
+    const results = await mod.exportSessionFilesBatched(databasePath, entries);
+    process.stdout.write(JSON.stringify(results));
+  } catch (err) {
+    process.stdout.write(JSON.stringify({ __error: err && err.message ? err.message : String(err) }));
+  }
+});
+`;
+
+  return new Promise((resolve) => {
+    const runInline = () => resolve(exportSessionFilesBatched(databasePath, entries));
+
+    let child;
+    try {
+      child = spawn(process.execPath, ['-e', workerSource], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      runInline();
+      return;
+    }
+
+    let stdout = '';
+    child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+    child.stderr.on('data', () => undefined);
+    child.on('error', () => runInline());
+    child.on('close', () => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stdout.trim());
+      } catch {
+        // The child produced nothing usable (no node:sqlite, a crash): fall
+        // back to running inline rather than silently syncing no sessions.
+        runInline();
+        return;
+      }
+      if (!Array.isArray(parsed)) {
+        runInline();
+        return;
+      }
+      resolve(parsed as BatchExportResult[]);
+    });
+
+    // Passed over stdin, not argv: a few hundred entries easily exceed
+    // Windows' ~32k command-line limit.
+    child.stdin.end(JSON.stringify({ databasePath, entries }));
+  });
+}
+
 export async function exportSessionFilesBatched(
   databasePath: string,
   entries: BatchExportEntry[]

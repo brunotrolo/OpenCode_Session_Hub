@@ -3,7 +3,7 @@ import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { mergeManySessionDatabases, mergeSessionDatabases } from './dbMerge';
-import { exportSessionFilesBatched } from './favoriteSessionExport';
+import { exportSessionFilesOffThread } from './favoriteSessionExport';
 import { loadDeletedSessions } from './deletedSessions';
 import { loadFavorites } from './favorites';
 import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
@@ -560,7 +560,7 @@ export class SyncManager {
     // of the message and part tables PER SESSION — on a real multi-GB
     // database with a few hundred sessions that alone made a push take
     // minutes. See exportSessionFilesBatched.
-    const results = await exportSessionFilesBatched(
+    const results = await exportSessionFilesOffThread(
       this.locations.databasePath,
       [...targets.keys()].map((sessionId) => ({ sessionId, outputPath: path.join(destDir, `${sessionId}.db`) }))
     );
