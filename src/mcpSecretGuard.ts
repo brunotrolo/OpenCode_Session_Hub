@@ -77,6 +77,30 @@ export function extractMcpSecrets(config: Record<string, unknown>): McpSecretGua
       }
     }
 
+    // A `local` MCP server passes its credentials as environment variables
+    // (`environment: { GITHUB_TOKEN: "ghp_..." }`), which is the single most
+    // common place a real token sits in an opencode.json — so leaving this
+    // out published exactly the secrets the rest of this module exists to
+    // catch. Unlike headers, an environment block also legitimately carries
+    // non-secret values (PATH, NODE_ENV), and blanket-templating those would
+    // break the server wherever the variable isn't set. So a value is
+    // replaced only when its own name reads as a credential, or its value
+    // matches one of the known credential shapes — the same two signals the
+    // rest of the codebase already redacts on.
+    const environment = getPlainObject(serverConfig.environment) ?? getPlainObject(serverConfig.env);
+    if (environment) {
+      for (const [variableName, variableValue] of Object.entries(environment)) {
+        if (typeof variableValue !== 'string' || !isSecretString(variableValue)) {
+          continue;
+        }
+        if (!isCredentialName(variableName) && !looksLikeCredentialValue(variableValue)) {
+          continue;
+        }
+        environment[variableName] = `{env:${buildHeaderEnvVar(serverName, variableName)}}`;
+        redactedCount += 1;
+      }
+    }
+
     const oauth = getPlainObject(serverConfig.oauth);
     if (oauth && typeof oauth.clientSecret === 'string' && isSecretString(oauth.clientSecret)) {
       const envVar = buildEnvVar(serverName, 'OAUTH_CLIENT_SECRET');
@@ -90,6 +114,28 @@ export function extractMcpSecrets(config: Record<string, unknown>): McpSecretGua
 
 function isSecretString(value: string): boolean {
   return value.length > 0 && !ENV_PLACEHOLDER_PATTERN.test(value);
+}
+
+/** Variable names that carry a credential by convention, e.g. GITHUB_TOKEN, API_KEY, DB_PASSWORD. */
+const CREDENTIAL_NAME_PATTERN = /(api[_-]?key|apikey|secret|password|passwd|token|credential|auth|^pat$|_pat$)/i;
+
+/** Credential shapes worth catching even under an innocuous variable name. */
+const CREDENTIAL_VALUE_PATTERNS: RegExp[] = [
+  /^sk-[a-zA-Z0-9_-]{10,}$/,
+  /^gh[pousr]_[a-zA-Z0-9]{20,}$/,
+  /^github_pat_[a-zA-Z0-9_]{20,}$/,
+  /^xox[baprs]-[a-zA-Z0-9-]{10,}$/,
+  /^AKIA[0-9A-Z]{16}$/,
+  /^AIza[0-9A-Za-z_-]{30,}$/,
+  /^eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}$/,
+];
+
+function isCredentialName(name: string): boolean {
+  return CREDENTIAL_NAME_PATTERN.test(name);
+}
+
+function looksLikeCredentialValue(value: string): boolean {
+  return CREDENTIAL_VALUE_PATTERNS.some((pattern) => pattern.test(value.trim()));
 }
 
 function buildHeaderEnvVar(serverName: string, headerName: string): string {

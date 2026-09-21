@@ -77,4 +77,50 @@ describe('mcpSecretGuard', () => {
       assert.strictEqual(sanitizeMcpSecretsInConfigText('"just a string"'), null);
     });
   });
+
+  describe('environment variables on a local MCP server', () => {
+    it('templates out a credential-named environment variable', () => {
+      // How a `local` MCP server actually carries its token — the most
+      // common place a real credential sits in an opencode.json.
+      const { sanitized, redactedCount } = extractMcpSecrets({
+        mcp: { github: { type: 'local', environment: { GITHUB_TOKEN: 'ghp_realtoken1234567890abc' } } },
+      });
+      assert.strictEqual(redactedCount, 1);
+      assert.strictEqual(
+        (sanitized as any).mcp.github.environment.GITHUB_TOKEN,
+        '{env:GITHUB_TOKEN}'
+      );
+    });
+
+    it('leaves non-secret environment variables untouched so the server still runs', () => {
+      const { sanitized, redactedCount } = extractMcpSecrets({
+        mcp: { srv: { type: 'local', environment: { NODE_ENV: 'production', PORT: '8080' } } },
+      });
+      assert.strictEqual(redactedCount, 0);
+      assert.strictEqual((sanitized as any).mcp.srv.environment.NODE_ENV, 'production');
+      assert.strictEqual((sanitized as any).mcp.srv.environment.PORT, '8080');
+    });
+
+    it('catches a credential-shaped value even under an innocuous variable name', () => {
+      const { sanitized, redactedCount } = extractMcpSecrets({
+        mcp: { srv: { type: 'local', environment: { SETTING: 'sk-abcdefghijklmnop12345' } } },
+      });
+      assert.strictEqual(redactedCount, 1);
+      assert.strictEqual((sanitized as any).mcp.srv.environment.SETTING, '{env:SETTING}');
+    });
+
+    it('also handles the shorthand `env` key', () => {
+      const { redactedCount } = extractMcpSecrets({
+        mcp: { srv: { type: 'local', env: { API_KEY: 'realvalue123456' } } },
+      });
+      assert.strictEqual(redactedCount, 1);
+    });
+
+    it('leaves an already-templated environment value alone', () => {
+      const { redactedCount } = extractMcpSecrets({
+        mcp: { srv: { type: 'local', environment: { GITHUB_TOKEN: '{env:GITHUB_TOKEN}' } } },
+      });
+      assert.strictEqual(redactedCount, 0);
+    });
+  });
 });
