@@ -31,6 +31,36 @@ both ways: config files/dirs, `~/.agents`, model favorites, and — only once
 `includeSecrets` + `privateRepoAcknowledged` are both true — session
 artifacts.
 
+## Per-session favorite sync
+
+`opencode.db` is one file for the whole machine's history — if it's stuck
+over the sync size limit (see below), NOTHING in it reaches another machine
+until that's fixed. Favoriting a session (`favoriteSessionExport.ts`,
+wired into `syncManager.ts`'s `mirrorFavoriteSessions`/
+`applyFavoriteSessions`) routes around that: each favorited session is
+exported to its own file, `data/favorite-sessions/<sessionId>.db`, keyed by
+session id, independent of whether the whole-database sync ever succeeds.
+
+- **One file per session, not one blob.** A single favorite's export
+  failing (session not found locally, unreadable, etc.) produces one skip
+  message and never blocks any other favorite — the opposite of the
+  whole-database path, where one problem stops everything.
+- **Reuses the row-level merge, not a separate import path.** The export
+  copies each relevant table's *exact* `CREATE TABLE` statement out of the
+  source database (`sqlite_master.sql`), so the resulting file has the
+  correct real schema — `dbMerge.ts`'s `mergeSessionDatabases()` can then
+  merge it into another machine's `opencode.db` with zero session-specific
+  code. On a genuinely fresh machine with no `opencode.db` yet (merge needs
+  the target's tables to already exist), the first favorite file applied
+  bootstraps it via a plain copy; the rest merge into that.
+- **Same privacy gate as full session sync**: only exported when
+  `includeSecrets` + `privateRepoAcknowledged` are both true, since a
+  favorited session is still message content.
+- **Still guarded by the same size limit per file** (defensive — a single
+  session is essentially never 90 MB, but a runaway one with huge tool
+  output shouldn't reproduce the exact problem this feature exists to route
+  around).
+
 Key safety properties, implemented in `syncManager.ts`:
 
 - **WAL-aware db sync**: attempts a passive SQLite checkpoint before syncing

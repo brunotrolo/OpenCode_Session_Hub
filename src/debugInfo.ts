@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
+import { loadFavorites } from './favorites';
 import { OpenCodeLocations } from './opencodePaths';
 import { SyncManager, SyncSettings } from './syncManager';
 
@@ -91,6 +92,21 @@ export async function buildDebugReport(
     }
   } else {
     lines.push('opencode.db-wal: absent or empty — nothing pending a checkpoint right now.');
+  }
+  lines.push('');
+
+  lines.push('-- Favorite sessions (synced individually, one file per session id) --');
+  const favorites = loadFavorites(locations);
+  if (favorites.length === 0) {
+    lines.push('None bookmarked yet — see the sidebar or "Save Favorite".');
+  } else {
+    lines.push(
+      `${favorites.length} bookmarked. Each syncs to its own data/favorite-sessions/<id>.db file regardless of ` +
+        "whether opencode.db itself is over the size limit — one session's export failing never blocks the others."
+    );
+    for (const favorite of favorites) {
+      lines.push(`  ${favorite.sessionId} — "${favorite.label}"`);
+    }
   }
   lines.push('');
 

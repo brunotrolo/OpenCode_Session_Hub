@@ -15,7 +15,10 @@ synced between machines through your own private Git repository.
   session across every project, newest first. Resume, preview, open the
   folder, generate a handoff, or delete.
 - **Favorite sessions** — bookmark a session with your own comment so it's
-  easy to find later, even if it's scrolled out of the recent list.
+  easy to find later, even if it's scrolled out of the recent list. Each
+  favorited session also syncs on its own, one small file per session id —
+  so it still reaches your other machines even while `opencode.db` itself
+  is too large to sync (see TECHNICAL.md).
 - **Cross-machine sync** — pull on startup, push when the window loses
   focus, or trigger manually. Session history only syncs once you confirm
   the remote repository is private.

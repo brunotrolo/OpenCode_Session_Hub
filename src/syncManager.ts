@@ -3,6 +3,8 @@ import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { mergeSessionDatabases } from './dbMerge';
+import { exportFavoriteSessionFile } from './favoriteSessionExport';
+import { loadFavorites } from './favorites';
 import { buildSyncPlan, OpenCodeLocations, SESSION_DB_REPO_PATH, SyncItem } from './opencodePaths';
 import { sanitizeJsonFile } from './secretSanitizer';
 
@@ -268,6 +270,15 @@ export class SyncManager {
 
     messages.push(...(await this.mirrorToRepo(items)));
 
+    // Independent of the whole-database sync above (which the oversized-file
+    // skip can leave permanently stuck): each favorited session is exported
+    // to its own small file, keyed by session id, so a bookmark still gets
+    // across even when the full opencode.db never can. One favorite failing
+    // to export never blocks any other — see mirrorFavoriteSessions.
+    if (this.settings.includeSecrets && this.settings.privateRepoAcknowledged) {
+      messages.push(...(await this.mirrorFavoriteSessions()));
+    }
+
     await this.git(['add', '-A']);
     const staged = (await this.git(['diff', '--cached', '--name-only'])).stdout.trim();
     if (staged) {
@@ -324,7 +335,102 @@ export class SyncManager {
 
     const applied = await this.applyFromRepo(items);
     messages.push(...applied.messages);
-    return { status: applied.count > 0 ? 'ok' : 'no-changes', messages, changedFiles: applied.count };
+
+    let favoriteCount = 0;
+    if (this.settings.includeSecrets && this.settings.privateRepoAcknowledged) {
+      const favoriteApplied = await this.applyFavoriteSessions();
+      messages.push(...favoriteApplied.messages);
+      favoriteCount = favoriteApplied.count;
+    }
+
+    const count = applied.count + favoriteCount;
+    return { status: count > 0 ? 'ok' : 'no-changes', messages, changedFiles: count };
+  }
+
+  /**
+   * Exports every favorited session to its own file under
+   * data/favorite-sessions/<sessionId>.db instead of relying on the
+   * whole-database sync — the point being that a bookmark still reaches the
+   * sync repo even when opencode.db itself is stuck over the size limit (see
+   * OVERSIZED_FILE_SKIP_BYTES) or a particular session's export fails for
+   * some other reason. Each file is independent: one failing produces one
+   * skip message and never stops the rest from syncing.
+   */
+  private async mirrorFavoriteSessions(): Promise<string[]> {
+    const favorites = loadFavorites(this.locations);
+    if (favorites.length === 0) {
+      return [];
+    }
+
+    const messages: string[] = [];
+    const destDir = path.join(this.repoDir, ...FAVORITE_SESSIONS_REPO_DIR.split('/'));
+    await fs.mkdir(destDir, { recursive: true });
+
+    for (const favorite of favorites) {
+      const outputPath = path.join(destDir, `${favorite.sessionId}.db`);
+      const result = await exportFavoriteSessionFile(this.locations.databasePath, favorite.sessionId, outputPath);
+      if (!result.ok) {
+        messages.push(`Favorite session "${favorite.label}" (${favorite.sessionId}) not synced: ${result.error}`);
+        continue;
+      }
+
+      // A favorited session is still just one session's worth of messages,
+      // so this should essentially never fire — but a runaway single
+      // session (huge tool output, say) is exactly the kind of thing this
+      // whole feature exists to route around, not reproduce.
+      const oversized = await this.checkOversizedFile(outputPath);
+      if (oversized) {
+        await fs.rm(outputPath, { force: true });
+        messages.push(`Favorite session "${favorite.label}" (${favorite.sessionId}) not synced: ${oversized}`);
+      }
+    }
+
+    return messages;
+  }
+
+  /**
+   * Applies every data/favorite-sessions/<id>.db file from the mirror into
+   * the local opencode.db, via the same row-level merge dbMerge.ts already
+   * uses for the whole-database case — a per-session export uses the exact
+   * same table schemas, so no separate import logic is needed. If the local
+   * opencode.db doesn't exist at all yet (a genuinely fresh machine),
+   * mergeSessionDatabases can't run (it needs the target's tables to already
+   * exist), so the first file found bootstraps it via a plain copy and the
+   * rest merge into that.
+   */
+  private async applyFavoriteSessions(): Promise<{ count: number; messages: string[] }> {
+    const dir = path.join(this.repoDir, ...FAVORITE_SESSIONS_REPO_DIR.split('/'));
+    const messages: string[] = [];
+    let count = 0;
+
+    for (const entry of await readDirEntries(dir)) {
+      if (!entry.isFile() || !entry.name.endsWith('.db')) {
+        continue;
+      }
+      const sourcePath = path.join(dir, entry.name);
+
+      try {
+        if (!(await exists(this.locations.databasePath))) {
+          await fs.mkdir(path.dirname(this.locations.databasePath), { recursive: true });
+          await fs.copyFile(sourcePath, this.locations.databasePath);
+          count += 1;
+          continue;
+        }
+
+        const merged = mergeSessionDatabases(this.locations.databasePath, sourcePath);
+        if (merged === null) {
+          messages.push(`Could not apply favorite session file ${entry.name}: node:sqlite unavailable or the file is unreadable.`);
+        } else if (merged > 0) {
+          count += 1;
+        }
+      } catch (err) {
+        messages.push(
+          `Could not apply favorite session file ${entry.name}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
+    return { count, messages };
   }
 
   /**
@@ -854,6 +960,9 @@ const MTIME_SAFETY_MARGIN_MS = 2000;
  * a push that was always going to be rejected.
  */
 const OVERSIZED_FILE_SKIP_BYTES = 90 * 1024 * 1024;
+
+/** Where per-session favorite exports live in the mirror, one file per session id — see mirrorFavoriteSessions/applyFavoriteSessions. */
+const FAVORITE_SESSIONS_REPO_DIR = 'data/favorite-sessions';
 
 /**
  * How long a `.git/index.lock` has to sit untouched before it's treated as

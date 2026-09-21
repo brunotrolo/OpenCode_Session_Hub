@@ -7,6 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import { resolveOpenCodeLocations } from '../opencodePaths';
 import { scanSessions } from '../sessionScanner';
 import { SyncManager, SyncSettings } from '../syncManager';
+import { addFavorite } from '../favorites';
 import { addSqliteSession, addStorageSession, createMachine, FakeMachine, writeJson } from './fixtures';
 
 /**
@@ -439,6 +440,89 @@ describe('two-machine sync simulation', () => {
     const aliceSessions = scanSessions(resolveOpenCodeLocations(alice.env, 'linux')).sessions.map((s) => s.id);
     assert.ok(aliceSessions.includes('ses_alice_only'), aliceSessions.join(', '));
     assert.ok(aliceSessions.includes('ses_bob_only'), aliceSessions.join(', '));
+  });
+
+  it('syncs a favorited session on its own even while the main database is stuck over the size limit', async () => {
+    // This is the actual real-world scenario: opencode.db has genuinely
+    // grown too large to sync (or the user hasn't compacted it yet), which
+    // would otherwise mean NOTHING from it ever reaches the other machine.
+    // Favoriting a session routes around that entirely — it's exported to
+    // its own small file, independent of the giant db's fate.
+    const favRemote = path.join(root, 'favorite-sync-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', favRemote]);
+
+    const alice = createMachine(root, 'fav-alice');
+    const bob = createMachine(root, 'fav-bob');
+    const aliceManager = managerFor(alice, { remoteUrl: favRemote });
+    const bobManager = managerFor(bob, { remoteUrl: favRemote });
+
+    addSqliteSession(alice, {
+      sessionId: 'ses_favorited',
+      projectId: 'prj_fav',
+      title: 'Important session worth keeping',
+      directory: '/work/important',
+      updated: 1_700_000_000_000,
+      messages: [{ id: 'msg_important', role: 'user', text: 'do not lose this', created: 1_700_000_000_000 }],
+    });
+    addFavorite(resolveOpenCodeLocations(alice.env, 'linux'), 'Important one', 'ses_favorited');
+
+    // Bloat the main database past the sync size limit — the whole-database
+    // path must never carry this session across, only the favorite export.
+    fs.appendFileSync(path.join(alice.dataRoot, 'opencode.db'), Buffer.alloc(95 * 1024 * 1024, 1));
+
+    const push = await aliceManager.push();
+    assert.notStrictEqual(push.status, 'error', push.messages.join(' | '));
+    assert.ok(
+      push.messages.some((m) => m.includes('opencode.db') && m.includes('exceeds')),
+      'expected the main database to still be reported as skipped'
+    );
+    assert.ok(
+      !fs.existsSync(path.join(alice.home, 'sync-repo', 'data', 'opencode.db')),
+      'the oversized main database must not reach the mirror'
+    );
+    assert.ok(
+      fs.existsSync(path.join(alice.home, 'sync-repo', 'data', 'favorite-sessions', 'ses_favorited.db')),
+      'the favorited session must reach the mirror on its own'
+    );
+
+    await bobManager.pull();
+    const bobSessions = scanSessions(resolveOpenCodeLocations(bob.env, 'linux')).sessions.map((s) => s.id);
+    assert.ok(bobSessions.includes('ses_favorited'), bobSessions.join(', '));
+  });
+
+  it('does not let one broken favorite block another from syncing', async () => {
+    const remote = path.join(root, 'mixed-favorites-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
+
+    const alice = createMachine(root, 'mixed-fav-alice');
+    const bob = createMachine(root, 'mixed-fav-bob');
+    const aliceManager = managerFor(alice, { remoteUrl: remote });
+
+    addSqliteSession(alice, {
+      sessionId: 'ses_real',
+      projectId: 'prj_mixed',
+      title: 'A real session',
+      directory: '/work/real',
+      updated: 1_700_000_000_000,
+    });
+    const locations = resolveOpenCodeLocations(alice.env, 'linux');
+    addFavorite(locations, 'Real one', 'ses_real');
+    addFavorite(locations, 'Points nowhere', 'ses_does_not_exist_at_all');
+
+    const push = await aliceManager.push();
+    assert.notStrictEqual(push.status, 'error', push.messages.join(' | '));
+    assert.ok(
+      push.messages.some((m) => m.includes('ses_does_not_exist_at_all') && m.includes('not synced')),
+      push.messages.join(' | ')
+    );
+    assert.ok(
+      fs.existsSync(path.join(alice.home, 'sync-repo', 'data', 'favorite-sessions', 'ses_real.db')),
+      'the valid favorite must still sync despite the broken one'
+    );
+
+    await managerFor(bob, { remoteUrl: remote }).pull();
+    const bobSessions = scanSessions(resolveOpenCodeLocations(bob.env, 'linux')).sessions.map((s) => s.id);
+    assert.ok(bobSessions.includes('ses_real'));
   });
 
   it('exposes ahead/behind status', async () => {
