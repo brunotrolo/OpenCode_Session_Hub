@@ -293,6 +293,67 @@ describe('sidebar dashboard', () => {
     assert.ok(!state.sessions.some((s: { id: string }) => s.id === 'ses_dash1'));
   });
 
+  it('opens a preview again after an earlier one was closed', async () => {
+    // Reported: "when I open a preview and close it, no other preview
+    // opens". Each request must build a fresh panel — nothing may be
+    // retained from a disposed one.
+    addStorageSession(machine, {
+      projectId: 'prj_a',
+      sessionId: 'ses_reopen',
+      title: 'Reopen preview session',
+      worktree: demoDir,
+    });
+    stub.webviews.length = 0;
+    await onMessage({ type: 'refresh' });
+
+    await onMessage({ type: 'previewSession', id: 'ses_reopen' });
+    assert.strictEqual(stub.webviews.length, 1);
+    stub.webviews[0].dispose();
+
+    await onMessage({ type: 'previewSession', id: 'ses_reopen' });
+    assert.strictEqual(stub.webviews.length, 2, 'closing a preview must not block opening the next one');
+    assert.ok(stub.webviews[1].html.includes('Reopen preview session'));
+
+    // And a third time, after closing both.
+    stub.webviews[1].dispose();
+    await onMessage({ type: 'previewSession', id: 'ses_reopen' });
+    assert.strictEqual(stub.webviews.length, 3);
+  });
+
+  it('still opens previews and deletes after an earlier delete', async () => {
+    // Reported: "when I ask to delete a conversation the extension freezes
+    // and it neither deletes nor opens a preview any more". Deleting one
+    // session must leave every other action working.
+    addStorageSession(machine, {
+      projectId: 'prj_a',
+      sessionId: 'ses_seq_delete',
+      title: 'Sequence delete target',
+      worktree: demoDir,
+    });
+    addStorageSession(machine, {
+      projectId: 'prj_a',
+      sessionId: 'ses_seq_survivor',
+      title: 'Sequence survivor',
+      worktree: demoDir,
+    });
+
+    stub.warningResponder = () => 'Delete';
+    stub.webviews.length = 0;
+    await onMessage({ type: 'refresh' });
+
+    await onMessage({ type: 'deleteSession', id: 'ses_seq_delete' });
+    assert.ok(!latestState().sessions.some((s: { id: string }) => s.id === 'ses_seq_delete'));
+
+    // Preview still works after a delete.
+    await onMessage({ type: 'previewSession', id: 'ses_seq_survivor' });
+    assert.strictEqual(stub.webviews.length, 1, 'preview must still work after deleting a session');
+    assert.ok(stub.webviews[0].html.includes('Sequence survivor'));
+
+    // And a second delete still works after the first.
+    await onMessage({ type: 'deleteSession', id: 'ses_seq_survivor' });
+    assert.ok(!latestState().sessions.some((s: { id: string }) => s.id === 'ses_seq_survivor'));
+  });
+
   it('warns instead of crashing when asked to delete an unknown session id', async () => {
     stub.messages.length = 0;
     await onMessage({ type: 'deleteSession', id: 'does-not-exist' });

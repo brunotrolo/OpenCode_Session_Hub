@@ -1,3 +1,10 @@
+export interface StubWebviewPanel {
+  title: string;
+  html: string;
+  disposed: boolean;
+  dispose(): void;
+}
+
 export interface StubState {
   commands: Map<string, (...args: unknown[]) => unknown>;
   config: Record<string, unknown>;
@@ -6,7 +13,7 @@ export interface StubState {
   /** Controls what a showWarningMessage(...) confirmation resolves to — e.g. return 'Delete' to confirm. */
   warningResponder: (text: string, ...items: string[]) => string | undefined;
   terminals: { name: string; cwd?: string; sent: string[] }[];
-  webviews: { title: string; html: string }[];
+  webviews: StubWebviewPanel[];
   messages: { kind: 'info' | 'warn' | 'error'; text: string }[];
   statusBar: { text: string; tooltip: string; command: string };
   disposed: boolean;
@@ -95,7 +102,24 @@ export function installVscodeStub(): StubState {
         return { show: () => undefined, sendText: (text: string) => terminal.sent.push(text) };
       },
       createWebviewPanel: (_id: string, title: string) => {
-        const panel = { title, html: '' };
+        // Modelled on the real panel: disposable, and reporting disposal to
+        // listeners. A preview that is opened and closed and opened again is
+        // a reported failure mode, so the stub has to be able to express it.
+        const disposeListeners: (() => void)[] = [];
+        const panel: StubWebviewPanel = {
+          title,
+          html: '',
+          disposed: false,
+          dispose: () => {
+            if (panel.disposed) {
+              return;
+            }
+            panel.disposed = true;
+            for (const listener of disposeListeners) {
+              listener();
+            }
+          },
+        };
         state.webviews.push(panel);
         return {
           webview: {
@@ -105,6 +129,12 @@ export function installVscodeStub(): StubState {
             set html(v: string) {
               panel.html = v;
             },
+          },
+          reveal: () => undefined,
+          dispose: () => panel.dispose(),
+          onDidDispose: (listener: () => void) => {
+            disposeListeners.push(listener);
+            return { dispose: () => undefined };
           },
         };
       },
