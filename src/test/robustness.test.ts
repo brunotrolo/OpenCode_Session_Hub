@@ -711,3 +711,113 @@ describe('a single session too large to sync', () => {
     }
   });
 });
+
+describe('two VS Code windows sharing one mirror', () => {
+  let root: string;
+
+  const settingsFor = (machine: FakeMachine, remote: string): SyncSettings => ({
+    remoteUrl: remote,
+    branch: 'main',
+    // Both "windows" deliberately share ONE mirror directory, exactly as
+    // every extension host on a machine shares globalStorage.
+    repoDir: path.join(root, 'shared-mirror'),
+    includeSecrets: true,
+    includeSessions: true,
+    includeModelFavorites: true,
+    includeOpencodeSkills: true,
+    includeAgentsDir: true,
+    redactSecrets: true,
+    privateRepoAcknowledged: true,
+  });
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'osh-two-windows-'));
+  });
+
+  after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('refuses to run a second sync against the same repo while one is in flight', async () => {
+    // SyncController's queue only orders operations inside ONE extension
+    // host. A second VS Code window has its own, so without a cross-process
+    // lock both run git against the same directory at once — which is how a
+    // real log produced "confused by unstable object source data" and a file
+    // vanishing mid-index.
+    const machine = createMachine(root, 'window-a');
+    addSqliteSession(machine, {
+      sessionId: 'ses_shared',
+      projectId: 'prj',
+      title: 'Shared',
+      directory: '/work',
+      updated: 1_700_000_000_000,
+      messages: [{ id: 'm1', role: 'user', text: 'text', created: 1_700_000_000_000 }],
+    });
+    const remote = path.join(root, 'shared.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
+    const locations = resolveOpenCodeLocations(machine.env, 'linux');
+    const settings = settingsFor(machine, remote);
+
+    // Hold the lock the way another window mid-sync would.
+    const lockPath = `${settings.repoDir}.lock`;
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, startedAt: Date.now() }), 'utf8');
+
+    try {
+      await assert.rejects(
+        () => new SyncManager(locations, settings).push(),
+        /Another VS Code window is syncing/,
+        'a second window must be told to wait, not race the first'
+      );
+    } finally {
+      fs.rmSync(lockPath, { force: true });
+    }
+
+    // Once the other window is done, syncing works normally again.
+    const outcome = await new SyncManager(locations, settingsFor(machine, remote)).push();
+    assert.strictEqual(outcome.status, 'ok', `push after the lock cleared failed: ${outcome.messages.join(' | ')}`);
+  });
+
+  it('takes over a lock left behind by a window that was force-quit', async () => {
+    // Otherwise one crashed window blocks syncing on this machine forever.
+    const machine = createMachine(root, 'window-b');
+    addSqliteSession(machine, {
+      sessionId: 'ses_stale_lock',
+      projectId: 'prj',
+      title: 'Stale lock',
+      directory: '/work',
+      updated: 1_700_000_000_000,
+      messages: [{ id: 'm1', role: 'user', text: 'text', created: 1_700_000_000_000 }],
+    });
+    const remote = path.join(root, 'stale.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remote]);
+    const locations = resolveOpenCodeLocations(machine.env, 'linux');
+    const settings = { ...settingsFor(machine, remote), repoDir: path.join(root, 'stale-mirror') };
+
+    const lockPath = `${settings.repoDir}.lock`;
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, startedAt: 0 }), 'utf8');
+    // Age it well past the staleness threshold, as a dead holder's would be.
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const outcome = await new SyncManager(locations, settings).push();
+    assert.strictEqual(outcome.status, 'ok', `a stale lock must be taken over: ${outcome.messages.join(' | ')}`);
+    assert.ok(!fs.existsSync(lockPath), 'the lock must be released when the sync finishes');
+  });
+
+  it('releases the lock even when the sync fails', async () => {
+    // A lock leaked on the error path would block every later sync until it
+    // aged out — turning one failure into minutes of dead time.
+    const machine = createMachine(root, 'window-c');
+    const locations = resolveOpenCodeLocations(machine.env, 'linux');
+    const settings = {
+      ...settingsFor(machine, path.join(root, 'nonexistent.git')),
+      repoDir: path.join(root, 'failing-mirror'),
+    };
+
+    await assert.rejects(() => new SyncManager(locations, settings).push());
+    assert.ok(
+      !fs.existsSync(`${settings.repoDir}.lock`),
+      'the lock must be released on the failure path too'
+    );
+  });
+});

@@ -174,6 +174,83 @@ export class SyncManager {
   }
 
   /**
+   * Serializes repo work ACROSS PROCESSES, not just within one.
+   *
+   * SyncController's queue only orders operations inside a single extension
+   * host. Every VS Code window runs its own, and they all share one mirror
+   * directory under globalStorage — so with several windows open (normal
+   * when working on more than one project) two of them run git against the
+   * same repository at once. `autoSyncOnFocusLost` makes that the common
+   * case rather than a rare one: switching from one window to another
+   * schedules a push in the window being left while the other is active.
+   *
+   * A real log showed the consequence: `git add -A` failing with "confused
+   * by unstable object source data", and once with a file vanishing
+   * mid-index — one window's git reading what another window was still
+   * writing. The lock is a file in `.git/` (never part of the working tree,
+   * so it can't be committed), created atomically with the `wx` flag. A
+   * holder that has gone away without releasing — a crashed or force-quit
+   * window — would otherwise block this machine forever, so a lock older
+   * than REPO_LOCK_STALE_MS is taken over; the holder refreshes it while it
+   * works so a legitimately slow sync is never mistaken for a dead one.
+   */
+  private async withRepoLock<T>(operation: () => Promise<T>): Promise<T> {
+    // Beside the repo directory, not inside it: a lock under .git/ would
+    // have to create .git before `git init` runs (which makes ensureRepo
+    // think the repo already exists), and one in the working tree could be
+    // committed. A sibling file is neither.
+    const lockPath = `${this.repoDir}.lock`;
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+
+    const attempts = [0, 500, 1500, 3000, 5000];
+    let acquired = false;
+    for (const delay of attempts) {
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      try {
+        const handle = await fs.open(lockPath, 'wx');
+        await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+        await handle.close();
+        acquired = true;
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+          throw err;
+        }
+        const stat = await statOrNull(lockPath);
+        if (stat && Date.now() - stat.mtimeMs > REPO_LOCK_STALE_MS) {
+          await fs.rm(lockPath, { force: true }).catch(() => undefined);
+        }
+      }
+    }
+
+    if (!acquired) {
+      throw new SyncError(
+        'Another VS Code window is syncing this repository right now. Nothing was changed — this sync will ' +
+          'run on its own shortly, or you can retry once the other one finishes.'
+      );
+    }
+
+    // Keeps the lock visibly alive so a slow-but-healthy sync is never
+    // taken over as stale by another window.
+    const heartbeat = setInterval(() => {
+      const now = new Date();
+      fs.utimes(lockPath, now, now).catch(() => undefined);
+    }, REPO_LOCK_HEARTBEAT_MS);
+    if (typeof heartbeat.unref === 'function') {
+      heartbeat.unref();
+    }
+
+    try {
+      return await operation();
+    } finally {
+      clearInterval(heartbeat);
+      await fs.rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
    * Removes `.git/index.lock` if it's old enough to be almost certainly
    * stale (see STALE_INDEX_LOCK_AGE_MS) rather than a real concurrent `git`
    * process. Plain git leaves this lock behind forever if the process
@@ -321,6 +398,10 @@ export class SyncManager {
   }
 
   async push(): Promise<SyncOutcome> {
+    return this.withRepoLock(() => this.pushLocked());
+  }
+
+  private async pushLocked(): Promise<SyncOutcome> {
     await this.ensureRepo();
     const { items, messages, secretsAllowed } = await this.effectivePlan();
 
@@ -401,6 +482,10 @@ export class SyncManager {
    * the user first.
    */
   async rebuildMirror(): Promise<{ discardedCommits: number; messages: string[] }> {
+    return this.withRepoLock(() => this.rebuildMirrorLocked());
+  }
+
+  private async rebuildMirrorLocked(): Promise<{ discardedCommits: number; messages: string[] }> {
     if (!this.settings.remoteUrl) {
       throw new SyncError('Set opencodeSessionHub.syncRemoteUrl before rebuilding the mirror.');
     }
@@ -509,6 +594,10 @@ export class SyncManager {
    * OpenCode can actually read.
    */
   async pull(): Promise<SyncOutcome> {
+    return this.withRepoLock(() => this.pullLocked());
+  }
+
+  private async pullLocked(): Promise<SyncOutcome> {
     await this.ensureRepo();
     const { items, messages, secretsAllowed } = await this.effectivePlan();
 
@@ -761,6 +850,10 @@ export class SyncManager {
    * sync to collide with all over again).
    */
   async resolveConflicts(keep: 'local' | 'remote'): Promise<SyncOutcome> {
+    return this.withRepoLock(() => this.resolveConflictsLocked(keep));
+  }
+
+  private async resolveConflictsLocked(keep: 'local' | 'remote'): Promise<SyncOutcome> {
     await this.ensureRepo();
     let conflicted = await this.listConflictedFiles();
 
@@ -1330,23 +1423,23 @@ export class SyncManager {
    * `git add -A` can transiently fail with "confused by unstable object
    * source data" — git detects a working-tree file's size changing mid-hash
    * and refuses to trust it, rather than commit something possibly
-   * inconsistent. This is a well-known Windows gotcha: antivirus (Windows
-   * Defender's real-time scanner especially) or a sync client like OneDrive
-   * briefly opening a file at the exact moment git is reading it produces
-   * exactly this symptom, even though nothing is actually wrong with the
-   * file — it's a momentary read race, not real corruption. Our own
-   * concurrency (SyncController's queue, atomic renames for exports) rules
-   * out this tool being the other reader, so a short retry — the same
-   * tolerance already given to individual locked-file copies — gives that
-   * external interference a chance to clear before treating it as a real
-   * failure.
+   * inconsistent.
    *
-   * A real report kept hitting this even with a first, shorter version of
-   * this retry (0/300/800ms, ~1.1s total) — too short a window for an AV
-   * scan of a large file (a multi-MB favorite-session export, say) to
-   * actually finish. Widened to ~15s total across more attempts, since the
-   * cost of waiting a bit longer on the rare case this fires is trivial
-   * next to failing the whole sync and making the user retry by hand.
+   * This was originally attributed to antivirus or OneDrive touching the
+   * file mid-hash, on the assumption that nothing of ours could be the
+   * other writer. That assumption was wrong. A later log from the same
+   * machine showed `git add -A` failing with
+   * `open("…/<id>.db.tmp-900-…"): No such file or directory` — git was
+   * indexing OUR export scratch file, which OUR code deleted from under it.
+   * Those scratch files were being written inside the repo (fixed: they go
+   * to the OS temp directory now), and two VS Code windows sharing one
+   * mirror directory could run git and an export against it at the same
+   * time (fixed: withRepoLock below). Between them, those account for the
+   * failures actually observed.
+   *
+   * The retry stays as a genuine last resort — a real external scanner can
+   * still produce this, and waiting a few seconds costs nothing next to
+   * failing the sync — but it is no longer the explanation.
    */
   private async gitAddAllWithRetry(): Promise<void> {
     const delays = [0, 300, 800, 1500, 3000, 4000, 5000];
@@ -1415,6 +1508,16 @@ const FAVORITE_SESSIONS_REPO_DIR = 'data/favorite-sessions';
  * Favorites are always exported and never counted against this.
  */
 const MAX_INDIVIDUAL_SESSION_EXPORTS = 200;
+
+/**
+ * How long a repo lock can sit unrefreshed before another window treats its
+ * holder as gone. Generous relative to the heartbeat below, so only a
+ * genuinely dead holder is ever taken over.
+ */
+const REPO_LOCK_STALE_MS = 2 * 60 * 1000;
+
+/** How often the lock holder refreshes its lock while it works. */
+const REPO_LOCK_HEARTBEAT_MS = 10 * 1000;
 
 /** Bounds inspectOversizedUnpushedHistory's scan so a very long unpushed history can't turn every push into a slow full scan. */
 const MAX_HISTORY_SCAN_COMMITS = 100;
