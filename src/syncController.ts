@@ -101,9 +101,9 @@ export class SyncController {
    * favorite bookmarking it. Local-only: the sync repo and any other
    * machine's copy are unaffected (see deleteSession()'s own note on why).
    */
-  deleteSession(record: SessionRecord): void {
+  async deleteSession(record: SessionRecord): Promise<void> {
     const locations = this.getLocations();
-    deleteSession(locations, record);
+    await deleteSession(locations, record);
     removeFavoritesBySessionId(locations, record.id);
   }
 

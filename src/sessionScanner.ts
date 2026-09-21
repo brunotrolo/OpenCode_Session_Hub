@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { OpenCodeLocations } from './opencodePaths';
+import { deleteSessionRows } from './dbMaintenance';
 
 export interface SessionMessage {
   id: string;
@@ -83,10 +84,10 @@ export function loadMessages(locations: OpenCodeLocations, record: SessionRecord
  * directories merge rather than mirror precisely so an incomplete local
  * state can't wipe another machine's history).
  */
-export function deleteSession(locations: OpenCodeLocations, record: SessionRecord): void {
+export async function deleteSession(locations: OpenCodeLocations, record: SessionRecord): Promise<void> {
   switch (record.source) {
     case 'sqlite':
-      deleteSqliteSession(locations.databasePath, record.id);
+      await deleteSqliteSession(locations.databasePath, record.id);
       return;
     case 'storage-json':
       deleteStorageSession(locations.storageRoot, record);
@@ -195,20 +196,41 @@ function loadSqliteMessages(databasePath: string, sessionId: string): SessionMes
   }
 
   try {
-    const rows = handle
+    // Two flat queries instead of a correlated subquery per message
+    // (`(SELECT group_concat(...) FROM part p WHERE p.message_id = m.id)`,
+    // evaluated once per row): a session with a couple thousand messages —
+    // not unusual for a long-running one — turned into a couple thousand
+    // scans of the part table, done synchronously, which could hang the
+    // whole preview (and the extension host with it) on a large database.
+    // `part` already carries its own `session_id`, so both queries scan
+    // their table once, total, regardless of message count.
+    const messageRows = handle
       .prepare(
-        `SELECT m.id AS id, m.time_created AS time_created, m.data AS message_data,
-                (SELECT group_concat(p.data, char(10)) FROM part p WHERE p.message_id = m.id) AS part_data
+        `SELECT m.id AS id, m.time_created AS time_created, m.data AS message_data
            FROM message m
           WHERE m.session_id = ?
           ORDER BY m.time_created ASC, m.id ASC`
       )
       .all(sessionId);
 
-    return rows.map((row) => ({
+    const partRows = handle
+      .prepare(`SELECT message_id, data FROM part WHERE session_id = ? ORDER BY message_id, id`)
+      .all(sessionId);
+    const partsByMessageId = new Map<string, string[]>();
+    for (const row of partRows) {
+      const key = String(row.message_id);
+      const list = partsByMessageId.get(key);
+      if (list) {
+        list.push(String(row.data ?? ''));
+      } else {
+        partsByMessageId.set(key, [String(row.data ?? '')]);
+      }
+    }
+
+    return messageRows.map((row) => ({
       id: String(row.id),
       role: extractRole(parseJson(row.message_data)),
-      text: extractPartsText(row.part_data),
+      text: extractPartsText((partsByMessageId.get(String(row.id)) ?? []).join('\n')),
       createdAt: toMillis(row.time_created),
     }));
   } catch {
@@ -225,30 +247,29 @@ function loadSqliteMessages(databasePath: string, sessionId: string): SessionMes
  * deleted explicitly rather than relying on ON DELETE CASCADE, since
  * cascading only applies when the connection has PRAGMA foreign_keys turned
  * on, which is not the default for a bare connection.
+ *
+ * The actual DELETEs run in a child process (see dbMaintenance.ts's
+ * deleteSessionRows) rather than inline: session_id has no index on part or
+ * message, so each statement is a full table scan, and on a multi-GB
+ * database that's long enough, done synchronously, to freeze the whole
+ * extension host (a real report — deleting looked "stuck" and broke
+ * subsequent delete/preview actions until VS Code was restarted).
  */
-function deleteSqliteSession(databasePath: string, sessionId: string): void {
+async function deleteSqliteSession(databasePath: string, sessionId: string): Promise<void> {
   if (!fs.existsSync(databasePath)) {
     return;
   }
 
-  let DatabaseSync: new (p: string, o?: Record<string, unknown>) => {
-    prepare(sql: string): { run(...params: unknown[]): void };
-    close(): void;
-  };
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    ({ DatabaseSync } = require('node:sqlite'));
+    require('node:sqlite');
   } catch {
     return;
   }
 
-  const db = new DatabaseSync(databasePath);
-  try {
-    db.prepare('DELETE FROM part WHERE session_id = ?').run(sessionId);
-    db.prepare('DELETE FROM message WHERE session_id = ?').run(sessionId);
-    db.prepare('DELETE FROM session WHERE id = ?').run(sessionId);
-  } finally {
-    db.close();
+  const result = await deleteSessionRows(databasePath, sessionId);
+  if (!result.ok) {
+    throw new Error(`Could not delete session from opencode.db: ${result.error}`);
   }
 }
 

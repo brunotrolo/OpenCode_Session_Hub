@@ -321,7 +321,12 @@ async function deleteSessionCommand(record: SessionRecord) {
   if (choice !== 'Delete') {
     return;
   }
-  controller.deleteSession(record);
+  try {
+    await controller.deleteSession(record);
+  } catch (err) {
+    vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
+    return;
+  }
   vscode.window.showInformationMessage(`Deleted "${record.title}".`);
 }
 

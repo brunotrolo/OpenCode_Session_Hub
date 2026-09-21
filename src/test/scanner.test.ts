@@ -158,6 +158,65 @@ describe('session scanner performance on a large database', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('loads one session\'s messages+parts with two flat queries, not one part scan per message', () => {
+    // Regression guard for a real report: loading a single session's parts
+    // via a correlated subquery per message turned opening a preview into
+    // one full scan of the part table PER MESSAGE — for a long-running
+    // session with a couple thousand messages, that hung the whole extension
+    // host, and looked to the user like "closing a preview breaks opening
+    // the next one" (the freeze just landed on whatever the next click was).
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'osh-scan-msgperf-'));
+    try {
+      const machine = createMachine(root, 'work');
+      const dbPath = path.join(machine.dataRoot, 'opencode.db');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL,
+                 title TEXT NOT NULL, time_created INTEGER, time_updated INTEGER)`);
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                 time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+      db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                 time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+
+      const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)');
+      const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)');
+      const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)');
+
+      insertSession.run('ses_big', 'prj', '/work', 'Big session', 1_700_000_000_000, 1_700_000_000_000);
+      // A second, unrelated session's rows share the same tables — the fix
+      // must not leak its parts into ses_big's transcript.
+      insertSession.run('ses_other', 'prj', '/work', 'Other session', 1_700_000_000_000, 1_700_000_000_000);
+      insertMessage.run('msg_other_1', 'ses_other', 1_700_000_000_000, 1_700_000_000_000, JSON.stringify({ role: 'user' }));
+      insertPart.run('prt_other_1', 'msg_other_1', 'ses_other', 1_700_000_000_000, 1_700_000_000_000, JSON.stringify({ type: 'text', text: 'not mine' }));
+
+      const messageCount = 2000;
+      db.exec('BEGIN;');
+      for (let i = 0; i < messageCount; i++) {
+        const messageId = `msg_${i}`;
+        insertMessage.run(messageId, 'ses_big', 1_700_000_000_000 + i, 1_700_000_000_000 + i, JSON.stringify({ role: i % 2 === 0 ? 'user' : 'assistant' }));
+        insertPart.run(`prt_${i}`, messageId, 'ses_big', 1_700_000_000_000 + i, 1_700_000_000_000 + i, JSON.stringify({ type: 'text', text: `message ${i}` }));
+      }
+      db.exec('COMMIT;');
+      db.close();
+
+      const loc = resolveOpenCodeLocations(machine.env, 'linux');
+      const session = scanSessions(loc).sessions.find((s) => s.id === 'ses_big')!;
+
+      const start = Date.now();
+      const messages = loadMessages(loc, session);
+      const elapsedMs = Date.now() - start;
+
+      assert.strictEqual(messages.length, messageCount);
+      assert.strictEqual(messages[0].text, 'message 0');
+      assert.strictEqual(messages[messageCount - 1].text, `message ${messageCount - 1}`);
+      assert.ok(!messages.some((m) => m.text === 'not mine'));
+      assert.ok(elapsedMs < 2000, `expected loading messages to stay fast; took ${elapsedMs}ms`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('path resolution', () => {

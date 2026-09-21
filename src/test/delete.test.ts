@@ -17,7 +17,7 @@ describe('deleting a session', () => {
 
   after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  it('removes a storage-json session, its messages and its parts', () => {
+  it('removes a storage-json session, its messages and its parts', async () => {
     const machine = createMachine(root, 'storage-json');
     addStorageSession(machine, {
       projectId: 'prj_a',
@@ -37,7 +37,7 @@ describe('deleting a session', () => {
     const locations = resolveOpenCodeLocations(machine.env, 'linux');
     const target = scanSessions(locations).sessions.find((s) => s.id === 'ses_to_delete')!;
 
-    deleteSession(locations, target);
+    await deleteSession(locations, target);
 
     const remaining = scanSessions(locations).sessions.map((s) => s.id);
     assert.deepStrictEqual(remaining, ['ses_keep']);
@@ -46,7 +46,7 @@ describe('deleting a session', () => {
     assert.ok(!fs.existsSync(path.join(machine.dataRoot, 'storage', 'part', 'msg_1')));
   });
 
-  it('removes a legacy-json session, its messages and its parts', () => {
+  it('removes a legacy-json session, its messages and its parts', async () => {
     const machine = createMachine(root, 'legacy-json');
     addLegacySession(machine, {
       projectDir: 'legacy-project',
@@ -59,7 +59,7 @@ describe('deleting a session', () => {
     const locations = resolveOpenCodeLocations(machine.env, 'linux');
     const target = scanSessions(locations).sessions.find((s) => s.id === 'ses_legacy_delete')!;
 
-    deleteSession(locations, target);
+    await deleteSession(locations, target);
 
     assert.deepStrictEqual(scanSessions(locations).sessions, []);
     const base = path.join(machine.dataRoot, 'project', 'legacy-project', 'storage', 'session');
@@ -68,7 +68,7 @@ describe('deleting a session', () => {
     assert.ok(!fs.existsSync(path.join(base, 'part', 'ses_legacy_delete')));
   });
 
-  it('removes a sqlite session, its messages and its parts', () => {
+  it('removes a sqlite session, its messages and its parts', async () => {
     const machine = createMachine(root, 'sqlite');
     addSqliteSession(machine, {
       sessionId: 'ses_sql_delete',
@@ -89,17 +89,17 @@ describe('deleting a session', () => {
     const locations = resolveOpenCodeLocations(machine.env, 'linux');
     const target = scanSessions(locations).sessions.find((s) => s.id === 'ses_sql_delete')!;
 
-    deleteSession(locations, target);
+    await deleteSession(locations, target);
 
     const remaining = scanSessions(locations).sessions;
     assert.deepStrictEqual(remaining.map((s) => s.id), ['ses_sql_keep']);
     assert.strictEqual(loadMessages(locations, target).length, 0);
   });
 
-  it('does not throw when the underlying files are already gone', () => {
+  it('does not throw when the underlying files are already gone', async () => {
     const machine = createMachine(root, 'already-gone');
     const locations = resolveOpenCodeLocations(machine.env, 'linux');
-    assert.doesNotThrow(() =>
+    await assert.doesNotReject(() =>
       deleteSession(locations, {
         id: 'ses_never_existed',
         title: 'Ghost',
@@ -137,12 +137,74 @@ describe('deleting a session', () => {
       );
 
       const target = scanSessions(locations).sessions.find((s) => s.id === 'ses_favorited')!;
-      controller.deleteSession(target);
+      await controller.deleteSession(target);
 
       assert.deepStrictEqual(scanSessions(locations).sessions, []);
       assert.deepStrictEqual(loadFavorites(locations), []);
     } finally {
       delete process.env.opencode_config_dir;
+    }
+  });
+});
+
+describe('deleting a sqlite session on a large database', () => {
+  it('deletes only the target session, leaving the rest of a large message/part table intact', async () => {
+    // Regression guard for a real report: DELETE FROM part/message WHERE
+    // session_id = ? has no index to use, so it's a full table scan — done
+    // synchronously via node:sqlite, that froze the whole extension host on
+    // a real ~7GB database and left it unable to delete or open a preview
+    // afterward. Deletion now runs in a child process (like VACUUM), which
+    // this test can't observe directly, but it does confirm deletion stays
+    // correct and doesn't regress into becoming unusably slow at a scale
+    // where the old synchronous, un-batched approach would show it clearly.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'osh-delete-perf-'));
+    try {
+      const machine = createMachine(root, 'work');
+      const dbPath = path.join(machine.dataRoot, 'opencode.db');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL,
+                 title TEXT NOT NULL, time_created INTEGER, time_updated INTEGER)`);
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                 time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+      db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                 time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+
+      const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)');
+      const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)');
+      const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)');
+
+      const sessionCount = 100;
+      const messagesPerSession = 30;
+      db.exec('BEGIN;');
+      for (let s = 0; s < sessionCount; s++) {
+        const sessionId = `ses_${s}`;
+        insertSession.run(sessionId, 'prj', '/work', `Session ${s}`, 1_700_000_000_000 + s, 1_700_000_000_000 + s);
+        for (let m = 0; m < messagesPerSession; m++) {
+          const messageId = `msg_${s}_${m}`;
+          insertMessage.run(messageId, sessionId, 1_700_000_000_000, 1_700_000_000_000, '{}');
+          insertPart.run(`prt_${messageId}`, messageId, sessionId, 1_700_000_000_000, 1_700_000_000_000, '{}');
+        }
+      }
+      db.exec('COMMIT;');
+      db.close();
+
+      const locations = resolveOpenCodeLocations(machine.env, 'linux');
+      const target = scanSessions(locations).sessions.find((s) => s.id === 'ses_50')!;
+
+      const start = Date.now();
+      await deleteSession(locations, target);
+      const elapsedMs = Date.now() - start;
+
+      const remaining = scanSessions(locations).sessions;
+      assert.strictEqual(remaining.length, sessionCount - 1);
+      assert.ok(!remaining.some((s) => s.id === 'ses_50'));
+      assert.strictEqual(remaining.find((s) => s.id === 'ses_49')?.messageCount, messagesPerSession);
+      assert.strictEqual(loadMessages(locations, target).length, 0);
+      assert.ok(elapsedMs < 5000, `expected deletion to stay reasonably fast; took ${elapsedMs}ms`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

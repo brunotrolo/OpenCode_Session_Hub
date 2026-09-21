@@ -193,3 +193,67 @@ async function statOrNull(target: string): Promise<fs.Stats | null> {
     return null;
   }
 }
+
+const DELETE_SESSION_WORKER_SOURCE = `
+const { DatabaseSync } = require('node:sqlite');
+const databasePath = process.argv[process.argv.length - 2];
+const sessionId = process.argv[process.argv.length - 1];
+const result = { ok: true };
+let db;
+try {
+  db = new DatabaseSync(databasePath);
+  db.exec('PRAGMA busy_timeout = 5000;');
+  db.prepare('DELETE FROM part WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM message WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM session WHERE id = ?').run(sessionId);
+} catch (err) {
+  result.ok = false;
+  result.error = err && err.message ? err.message : String(err);
+} finally {
+  try { db && db.close(); } catch {}
+}
+process.stdout.write(JSON.stringify(result));
+`;
+
+/**
+ * DELETE FROM part/message WHERE session_id = ? has no index to lean on
+ * (OpenCode's schema doesn't index that column), so each statement is a full
+ * table scan. On a database that has grown into the multi-GB range (a real
+ * report: ~7GB with a message/part table in the hundreds of thousands of
+ * rows), three sequential full scans done synchronously via node:sqlite can
+ * take long enough to look — and effectively be — a total freeze of the
+ * extension host: every other command, the dashboard, and any preview panel
+ * stop responding until it finishes. Running it in a throwaway child process
+ * (same trick as VACUUM above) keeps the extension host responsive while the
+ * scan runs, whatever it ends up costing.
+ */
+export function deleteSessionRows(databasePath: string, sessionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(process.execPath, ['-e', DELETE_SESSION_WORKER_SOURCE, '--', databasePath, sessionId], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ ok: false, error: `Could not start the delete process: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+    child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
+    child.on('error', (err) => resolve({ ok: false, error: `Could not start the delete process: ${err.message}` }));
+    child.on('close', () => {
+      try {
+        resolve(JSON.parse(stdout.trim()) as { ok: true } | { ok: false; error: string });
+      } catch {
+        resolve({
+          ok: false,
+          error: `The delete process produced no usable result.${stderr.trim() ? ` (stderr: ${stderr.trim()})` : ''}`,
+        });
+      }
+    });
+  });
+}

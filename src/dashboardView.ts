@@ -237,7 +237,12 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    this.controller.deleteSession(record);
+    try {
+      await this.controller.deleteSession(record);
+    } catch (err) {
+      vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
+      return;
+    }
     this.postState();
   }
 
