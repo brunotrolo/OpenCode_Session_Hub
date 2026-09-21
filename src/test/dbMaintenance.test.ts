@@ -46,6 +46,93 @@ describe('vacuumDatabase', () => {
     });
   });
 
+  it('shrinks the WAL back to empty once nothing else has the database open', async () => {
+    const dbPath = path.join(root, 'clean-wal.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec('PRAGMA journal_mode=WAL;');
+    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+    const insert = db.prepare('INSERT INTO t (v) VALUES (?)');
+    for (let i = 0; i < 500; i++) {
+      insert.run('x'.repeat(4096));
+    }
+    // node:sqlite's close() itself checkpoints as the last connection
+    // closes, which is exactly the "OpenCode actually closed cleanly" case
+    // — proving the happy path still produces a clean, warning-free result
+    // once nothing is genuinely holding the file open anymore.
+    db.close();
+
+    const result = await vacuumDatabase(dbPath);
+    assert.ok(result.ok, result.ok ? '' : result.error);
+    if (!result.ok) {
+      return;
+    }
+    assert.strictEqual(result.walAfterBytes, 0);
+    assert.strictEqual(result.walWarning, undefined);
+  });
+
+  it('warns when the WAL cannot shrink because another connection still has the database open', async () => {
+    // The far more likely real-world cause of a stuck multi-GB WAL than a
+    // pinned read transaction: OpenCode (or some other process) still has
+    // the database open, even completely idle. TRUNCATE checkpoints the
+    // content fine (busy=0) but SQLite still won't truncate the file itself
+    // while another connection has it mapped — so this has to be detected
+    // from the actual post-checkpoint file size, not the pragma's own
+    // busy flag (see the pinned-reader test below for the busy!=0 case).
+    const dbPath = path.join(root, 'lingering-connection.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const lingering = new DatabaseSync(dbPath);
+    lingering.exec('PRAGMA journal_mode=WAL;');
+    lingering.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+    const insert = lingering.prepare('INSERT INTO t (v) VALUES (?)');
+    for (let i = 0; i < 500; i++) {
+      insert.run('x'.repeat(4096));
+    }
+
+    try {
+      const result = await vacuumDatabase(dbPath);
+      assert.ok(result.ok, result.ok ? '' : result.error);
+      if (result.ok) {
+        assert.ok(result.walAfterBytes > 0, 'expected the WAL to remain non-empty while another connection holds it open');
+        assert.ok(result.walWarning, 'expected a warning naming the lingering connection');
+      }
+    } finally {
+      lingering.close();
+    }
+  });
+
+  it('warns instead of failing when a pinned reader prevents the WAL from fully draining', async () => {
+    const dbPath = path.join(root, 'pinned-reader.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const writer = new DatabaseSync(dbPath);
+    writer.exec('PRAGMA journal_mode=WAL;');
+    writer.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+    writer.exec("INSERT INTO t (v) VALUES ('one');");
+
+    const reader = new DatabaseSync(dbPath);
+    reader.exec('BEGIN;');
+    reader.prepare('SELECT * FROM t').all(); // pins this snapshot open
+
+    writer.exec("INSERT INTO t (v) VALUES ('two');"); // a frame the pinned snapshot excludes
+    writer.close();
+
+    try {
+      const result = await vacuumDatabase(dbPath);
+      // VACUUM itself can still succeed even when the checkpoint couldn't
+      // fully drain — the warning is informational, not a failure.
+      assert.ok(result.ok, result.ok ? '' : result.error);
+      if (result.ok) {
+        assert.ok(result.walWarning, 'expected a warning about the incomplete checkpoint');
+      }
+    } finally {
+      reader.exec('ROLLBACK;');
+      reader.close();
+    }
+  });
+
   it('reports a clear error for a database that does not exist', async () => {
     const result = await vacuumDatabase(path.join(root, 'does-not-exist.db'));
     assert.strictEqual(result.ok, false);

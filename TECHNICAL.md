@@ -73,6 +73,25 @@ Key safety properties, implemented in `syncManager.ts`:
   sync still has to run afterward to publish the smaller file) and refuses
   cleanly with a "close OpenCode and try again" message if the database is
   locked, rather than corrupting anything.
+
+  It checkpoints with `TRUNCATE` before vacuuming, not the `PASSIVE` mode
+  `syncManager.ts` uses during a live sync — `PASSIVE` only merges WAL
+  content into the main file without ever shrinking the WAL file itself,
+  which is exactly how a real report ended up with a 7 GB `opencode.db-wal`
+  bigger than the main database. `TRUNCATE` is safe to demand here
+  specifically because the caller has already told the user to close
+  OpenCode first, unlike a background sync that must never block a live
+  writer. Even then, SQLite won't actually truncate the WAL file while ANY
+  other connection has it open — including a merely idle one with no
+  transaction in flight — so a successful, non-busy checkpoint doesn't
+  guarantee the file shrinks. This is checked against the real outcome (the
+  WAL's size after checkpointing), not just the checkpoint pragma's own
+  `busy` flag, and surfaces as a `walWarning` pointing at the likely cause: a
+  lingering OpenCode process the user hasn't actually closed, not a stuck
+  transaction. `debugInfo.ts` also flags a WAL over the sync limit on its
+  own, independent of ever having run Compact Database, since a WAL that
+  large (especially one comparable to or bigger than the main file) is
+  itself a sign nothing has ever fully checkpointed it.
 - **Stale `.git/index.lock` recovery** (`clearStaleIndexLock`,
   `STALE_INDEX_LOCK_AGE_MS` = 2 minutes): plain git leaves this lock behind
   forever if the process holding it is killed mid-operation (VS Code

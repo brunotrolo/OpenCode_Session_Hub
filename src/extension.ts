@@ -183,9 +183,17 @@ async function compactDatabase() {
 
   const beforeMb = (result.beforeBytes / (1024 * 1024)).toFixed(0);
   const afterMb = (result.afterBytes / (1024 * 1024)).toFixed(0);
+  const walBeforeMb = (result.walBeforeBytes / (1024 * 1024)).toFixed(0);
+  const walAfterMb = (result.walAfterBytes / (1024 * 1024)).toFixed(0);
+  const walSummary = result.walBeforeBytes > 0 || result.walAfterBytes > 0 ? `, WAL ${walBeforeMb} MB -> ${walAfterMb} MB` : '';
+
   vscode.window.showInformationMessage(
-    `opencode.db compacted: ${beforeMb} MB -> ${afterMb} MB. Run "Push Now" to sync the smaller database.`
+    `opencode.db compacted: ${beforeMb} MB -> ${afterMb} MB${walSummary}. Run "Push Now" to sync the smaller database.`
   );
+
+  if (result.walWarning) {
+    vscode.window.showWarningMessage(`OpenCode Session Hub: ${result.walWarning}`);
+  }
 }
 
 async function showSyncStatus() {

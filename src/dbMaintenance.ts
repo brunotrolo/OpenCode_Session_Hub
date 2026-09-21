@@ -1,11 +1,26 @@
 import * as fs from 'fs';
 
 export type VacuumResult =
-  | { ok: true; beforeBytes: number; afterBytes: number }
+  | {
+      ok: true;
+      beforeBytes: number;
+      afterBytes: number;
+      walBeforeBytes: number;
+      walAfterBytes: number;
+      /** Set when the WAL checkpoint couldn't fully drain — something still has the database open despite the "close OpenCode" instruction. */
+      walWarning?: string;
+    }
   | { ok: false; error: string };
+
+interface CheckpointRow {
+  busy: number;
+  log: number;
+  checkpointed: number;
+}
 
 interface VacuumHandle {
   exec(sql: string): void;
+  prepare(sql: string): { get(): Record<string, unknown> | undefined };
   close(): void;
 }
 
@@ -38,19 +53,34 @@ export async function vacuumDatabase(databasePath: string): Promise<VacuumResult
   if (!beforeStat) {
     return { ok: false, error: `${databasePath} does not exist on this machine.` };
   }
+  const walPath = `${databasePath}-wal`;
+  const walBeforeStat = await statOrNull(walPath);
 
   let db: VacuumHandle | undefined;
+  let walWarning: string | undefined;
   try {
     db = new DatabaseSync(databasePath);
-    // A passive checkpoint first folds any pending WAL frames into the main
-    // file, so VACUUM rewrites the database's actual current state rather
-    // than potentially missing very recent writes.
+
+    // TRUNCATE (not the PASSIVE mode syncManager.ts uses during a live sync)
+    // is what actually shrinks the WAL file back to empty — PASSIVE only
+    // folds committed frames into the main file without truncating it. This
+    // is safe to demand here specifically because the caller has already
+    // told the user to close OpenCode first; unlike a background sync, this
+    // operation is allowed to require exclusive access.
     try {
-      db.exec('PRAGMA wal_checkpoint(PASSIVE);');
-    } catch {
-      // Best-effort — VACUUM below still runs against whatever the main file
-      // currently holds even if this didn't fully drain the WAL.
+      const row = db.prepare('PRAGMA wal_checkpoint(TRUNCATE);').get() as unknown as CheckpointRow | undefined;
+      if (row && Number(row.busy) !== 0) {
+        walWarning =
+          'The WAL checkpoint could not fully complete — something still has opencode.db open ' +
+          '(check for a lingering OpenCode or sqlite3 process) even though it was supposed to be closed. ' +
+          'The database was still compacted, but the WAL file may not have fully shrunk.';
+      }
+    } catch (err) {
+      walWarning = `Could not checkpoint the WAL before compacting: ${
+        err instanceof Error ? err.message : String(err)
+      }`;
     }
+
     db.exec('VACUUM;');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -70,7 +100,32 @@ export async function vacuumDatabase(databasePath: string): Promise<VacuumResult
   }
 
   const afterStat = await statOrNull(databasePath);
-  return { ok: true, beforeBytes: beforeStat.size, afterBytes: afterStat?.size ?? beforeStat.size };
+  const walAfterStat = await statOrNull(walPath);
+  const walAfterBytes = walAfterStat?.size ?? 0;
+
+  // A TRUNCATE checkpoint can report success (busy=0 — every frame got
+  // merged) and still leave the WAL file at its prior size: SQLite only
+  // truncates the file itself when NO other connection has it mapped, even
+  // an idle one with no in-flight transaction. That's a distinct, more
+  // common failure mode than the pinned-reader case above (a Task
+  // Manager-invisible "OpenCode isn't really closed" is far more likely
+  // than a stuck read transaction), so it's checked directly against the
+  // outcome rather than trusting the pragma's own busy flag alone.
+  if (!walWarning && walAfterBytes > 0) {
+    walWarning =
+      'The WAL file did not shrink after compacting — another connection still has opencode.db open (this can ' +
+      'happen even without an active read/write, if the process itself is still running). Close OpenCode ' +
+      'completely and check for a lingering process before trying again.';
+  }
+
+  return {
+    ok: true,
+    beforeBytes: beforeStat.size,
+    afterBytes: afterStat?.size ?? beforeStat.size,
+    walBeforeBytes: walBeforeStat?.size ?? 0,
+    walAfterBytes,
+    walWarning,
+  };
 }
 
 async function statOrNull(target: string): Promise<fs.Stats | null> {

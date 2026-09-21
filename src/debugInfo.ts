@@ -71,11 +71,24 @@ export async function buildDebugReport(
   }
   const walStat = await statOrNull(`${locations.databasePath}-wal`);
   if (walStat && walStat.size > 0) {
+    const walMb = walStat.size / (1024 * 1024);
     lines.push(
-      `opencode.db-wal: ${walStat.size} bytes — uncheckpointed writes. If this is still non-zero after a ` +
-        'push, OpenCode is writing continuously enough that the safe checkpoint attempt could not fully drain it; ' +
-        'the db will be skipped again until a lull.'
+      `opencode.db-wal: ${walStat.size} bytes (${walMb.toFixed(0)} MB) — uncheckpointed writes. If this is ` +
+        'still non-zero after a push, OpenCode is writing continuously enough that the safe checkpoint attempt ' +
+        'could not fully drain it; the db will be skipped again until a lull.'
     );
+    if (walMb > OVERSIZED_FILE_SKIP_MB) {
+      lines.push(
+        `  WARNING: a WAL file this large (especially if it's comparable to or bigger than opencode.db itself) ` +
+          "is not normal — a PASSIVE checkpoint only ever merges what it can without blocking, so it never shrinks " +
+          'this file. This usually means something is holding the database open continuously (OpenCode running, ' +
+          'or a leftover process from a previous run) and preventing a full checkpoint, rather than genuinely ' +
+          'huge write volume. "Compact Database" uses a TRUNCATE checkpoint instead, which does shrink this file ' +
+          '— but only if the database is genuinely not open anywhere else. If it reports the WAL still could not ' +
+          "be fully drained, check Task Manager (or `tasklist | findstr opencode`) for a lingering OpenCode " +
+          'process even after closing the window.'
+      );
+    }
   } else {
     lines.push('opencode.db-wal: absent or empty — nothing pending a checkpoint right now.');
   }
