@@ -92,6 +92,22 @@ Key safety properties, implemented in `syncManager.ts`:
   own, independent of ever having run Compact Database, since a WAL that
   large (especially one comparable to or bigger than the main file) is
   itself a sign nothing has ever fully checkpointed it.
+
+  `node:sqlite`'s `exec()`/`prepare().get()` are fully synchronous, and
+  VACUUM on a multi-GB database is a lot of pure disk I/O — potentially
+  minutes. Running that inline in the extension host, as this was first
+  shipped, blocks the entire Node event loop for the whole duration: every
+  other extension, all UI messages, and even the "compacting..." progress
+  notification itself (rendering it also round-trips through the same
+  blocked event loop). A real report confirmed this looks exactly like "the
+  button did nothing" — nothing visibly happens, because nothing CAN render
+  while it's blocked. `vacuumDatabase()` now runs the actual checkpoint+VACUUM
+  in a separate child process (`runVacuumWorker`, an inline script passed via
+  `-e`) instead, keeping the extension host responsive throughout.
+  `ELECTRON_RUN_AS_NODE=1` makes VS Code's own bundled Electron binary behave
+  as a plain Node CLI for that one child process, so this needs no separate
+  Node install and runs the exact same `node:sqlite` build already running
+  the extension host — just off its main thread.
 - **Stale `.git/index.lock` recovery** (`clearStaleIndexLock`,
   `STALE_INDEX_LOCK_AGE_MS` = 2 minutes): plain git leaves this lock behind
   forever if the process holding it is killed mid-operation (VS Code

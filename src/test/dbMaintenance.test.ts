@@ -14,6 +14,51 @@ describe('vacuumDatabase', () => {
 
   after(() => fs.rmSync(root, { recursive: true, force: true }));
 
+  it('does not block the caller\'s event loop while VACUUM runs', async () => {
+    // node:sqlite's exec() is fully synchronous; run inline (as this used to
+    // be implemented) VACUUM on a large database would freeze the entire
+    // extension host for the whole operation — indistinguishable from "the
+    // button did nothing." vacuumDatabase() runs the actual work in a
+    // separate process specifically to avoid that. A timer that keeps
+    // firing on schedule while the vacuum is in flight proves the caller's
+    // own event loop was never blocked.
+    const dbPath = path.join(root, 'nonblocking.db');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, blob TEXT NOT NULL)');
+    const insert = db.prepare('INSERT INTO t (blob) VALUES (?)');
+    const filler = 'x'.repeat(65536);
+    for (let i = 0; i < 1500; i++) {
+      insert.run(filler);
+    }
+    db.exec('DELETE FROM t WHERE id % 2 = 0');
+    db.close();
+
+    let ticks = 0;
+    const timer = setInterval(() => {
+      ticks++;
+    }, 20);
+
+    try {
+      const start = Date.now();
+      const result = await vacuumDatabase(dbPath);
+      const elapsedMs = Date.now() - start;
+      assert.ok(result.ok, result.ok ? '' : result.error);
+
+      // A blocked event loop would report ~0 ticks regardless of how long
+      // the operation actually took; a free one ticks roughly once per
+      // interval the whole time.
+      const expectedMinimumTicks = Math.floor(elapsedMs / 20 / 2); // generous floor, not exact timing
+      assert.ok(
+        ticks >= Math.min(expectedMinimumTicks, 3),
+        `expected the event loop to keep ticking during the vacuum; got ${ticks} ticks over ${elapsedMs}ms`
+      );
+    } finally {
+      clearInterval(timer);
+    }
+  });
+
   it('shrinks a database bloated by deleted rows', () => {
     const dbPath = path.join(root, 'bloated.db');
     // eslint-disable-next-line @typescript-eslint/no-var-requires

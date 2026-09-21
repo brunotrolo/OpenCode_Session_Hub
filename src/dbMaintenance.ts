@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 
 export type VacuumResult =
@@ -12,16 +13,89 @@ export type VacuumResult =
     }
   | { ok: false; error: string };
 
-interface CheckpointRow {
-  busy: number;
-  log: number;
-  checkpointed: number;
+interface WorkerResult {
+  ok: boolean;
+  error?: string;
+  checkpointBusy?: boolean;
+  checkpointError?: string;
 }
 
-interface VacuumHandle {
-  exec(sql: string): void;
-  prepare(sql: string): { get(): Record<string, unknown> | undefined };
-  close(): void;
+/**
+ * Runs entirely in a separate, throwaway Node process — see the big comment
+ * on runVacuumWorker() below for why. Keep this self-contained: it can't
+ * import anything from the extension, since it never runs inside it.
+ */
+const WORKER_SOURCE = `
+const { DatabaseSync } = require('node:sqlite');
+const databasePath = process.argv[process.argv.length - 1];
+const result = { ok: true };
+let db;
+try {
+  db = new DatabaseSync(databasePath);
+  try {
+    const row = db.prepare('PRAGMA wal_checkpoint(TRUNCATE);').get();
+    if (row && Number(row.busy) !== 0) {
+      result.checkpointBusy = true;
+    }
+  } catch (err) {
+    result.checkpointError = err && err.message ? err.message : String(err);
+  }
+  db.exec('VACUUM;');
+} catch (err) {
+  result.ok = false;
+  result.error = err && err.message ? err.message : String(err);
+} finally {
+  try { db && db.close(); } catch {}
+}
+process.stdout.write(JSON.stringify(result));
+`;
+
+/**
+ * node:sqlite's exec()/prepare().get() are fully synchronous, and VACUUM on
+ * a multi-GB database is a lot of pure disk I/O — potentially minutes. Run
+ * inline in the extension host (as this used to), that blocks the ENTIRE
+ * Node event loop the whole time: every other extension, all UI messages,
+ * and even the "compacting..." progress notification itself (rendering it
+ * also has to round-trip through the same blocked event loop). The result
+ * looks exactly like "the button did nothing" for as long as it runs.
+ *
+ * Spawning a separate process keeps the extension host responsive the whole
+ * time. `ELECTRON_RUN_AS_NODE` makes VS Code's own bundled Electron binary
+ * behave as a plain Node CLI for this one child process — no separate Node
+ * installation required, and it's the exact same runtime (and node:sqlite
+ * build) already running the extension host, so behavior is identical to
+ * what running it inline would have done, just off the main thread. Passing
+ * the script via `-e` (not a temp file) means nothing is left on disk.
+ */
+function runVacuumWorker(databasePath: string): Promise<WorkerResult> {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(process.execPath, ['-e', WORKER_SOURCE, '--', databasePath], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ ok: false, error: `Could not start the compact process: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+    child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
+    child.on('error', (err) => resolve({ ok: false, error: `Could not start the compact process: ${err.message}` }));
+    child.on('close', () => {
+      try {
+        resolve(JSON.parse(stdout.trim()) as WorkerResult);
+      } catch {
+        resolve({
+          ok: false,
+          error: `The compact process produced no usable result.${stderr.trim() ? ` (stderr: ${stderr.trim()})` : ''}`,
+        });
+      }
+    });
+  });
 }
 
 /**
@@ -41,10 +115,9 @@ interface VacuumHandle {
  * actual fix.
  */
 export async function vacuumDatabase(databasePath: string): Promise<VacuumResult> {
-  let DatabaseSync: new (p: string, o?: Record<string, unknown>) => VacuumHandle;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    ({ DatabaseSync } = require('node:sqlite'));
+    require('node:sqlite');
   } catch {
     return { ok: false, error: 'This VS Code build has no node:sqlite (needs Node 22.5+).' };
   }
@@ -56,34 +129,9 @@ export async function vacuumDatabase(databasePath: string): Promise<VacuumResult
   const walPath = `${databasePath}-wal`;
   const walBeforeStat = await statOrNull(walPath);
 
-  let db: VacuumHandle | undefined;
-  let walWarning: string | undefined;
-  try {
-    db = new DatabaseSync(databasePath);
-
-    // TRUNCATE (not the PASSIVE mode syncManager.ts uses during a live sync)
-    // is what actually shrinks the WAL file back to empty — PASSIVE only
-    // folds committed frames into the main file without truncating it. This
-    // is safe to demand here specifically because the caller has already
-    // told the user to close OpenCode first; unlike a background sync, this
-    // operation is allowed to require exclusive access.
-    try {
-      const row = db.prepare('PRAGMA wal_checkpoint(TRUNCATE);').get() as unknown as CheckpointRow | undefined;
-      if (row && Number(row.busy) !== 0) {
-        walWarning =
-          'The WAL checkpoint could not fully complete — something still has opencode.db open ' +
-          '(check for a lingering OpenCode or sqlite3 process) even though it was supposed to be closed. ' +
-          'The database was still compacted, but the WAL file may not have fully shrunk.';
-      }
-    } catch (err) {
-      walWarning = `Could not checkpoint the WAL before compacting: ${
-        err instanceof Error ? err.message : String(err)
-      }`;
-    }
-
-    db.exec('VACUUM;');
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+  const workerResult = await runVacuumWorker(databasePath);
+  if (!workerResult.ok) {
+    const message = workerResult.error ?? 'unknown error';
     const locked = /locked|busy/i.test(message);
     return {
       ok: false,
@@ -91,12 +139,22 @@ export async function vacuumDatabase(databasePath: string): Promise<VacuumResult
         ? 'The database is in use (locked or busy) — close OpenCode (and any other program with it open) and try again.'
         : `VACUUM failed: ${message}`,
     };
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      // ignore
-    }
+  }
+
+  // TRUNCATE (not the PASSIVE mode syncManager.ts uses during a live sync)
+  // is what actually shrinks the WAL file back to empty — PASSIVE only
+  // folds committed frames into the main file without truncating it. This
+  // is safe to demand here specifically because the caller has already told
+  // the user to close OpenCode first; unlike a background sync, this
+  // operation is allowed to require exclusive access.
+  let walWarning: string | undefined;
+  if (workerResult.checkpointBusy) {
+    walWarning =
+      'The WAL checkpoint could not fully complete — something still has opencode.db open ' +
+      '(check for a lingering OpenCode or sqlite3 process) even though it was supposed to be closed. ' +
+      'The database was still compacted, but the WAL file may not have fully shrunk.';
+  } else if (workerResult.checkpointError) {
+    walWarning = `Could not checkpoint the WAL before compacting: ${workerResult.checkpointError}`;
   }
 
   const afterStat = await statOrNull(databasePath);
