@@ -140,6 +140,14 @@ function readSqliteSessions(databasePath: string): ScanResult {
   }
 
   try {
+    // A correlated subquery here (`(SELECT COUNT(*) FROM message m WHERE
+    // m.session_id = s.id)` per session row) runs one scan of the message
+    // table PER SESSION — with a few hundred sessions and a message table
+    // that's grown into the hundreds of thousands of rows, that's a few
+    // hundred full scans done synchronously, which can block the whole
+    // extension host for a very long time. Aggregating message counts once
+    // via GROUP BY and joining that single result is the same information,
+    // computed with one scan total instead of N.
     const rows = handle
       .prepare(
         `SELECT s.id           AS id,
@@ -148,8 +156,13 @@ function readSqliteSessions(databasePath: string): ScanResult {
                 s.project_id   AS project_id,
                 s.time_created AS time_created,
                 s.time_updated AS time_updated,
-                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS message_count
+                COALESCE(mc.message_count, 0) AS message_count
            FROM session s
+           LEFT JOIN (
+                SELECT session_id, COUNT(*) AS message_count
+                  FROM message
+                 GROUP BY session_id
+           ) mc ON mc.session_id = s.id
           ORDER BY s.time_updated DESC`
       )
       .all();

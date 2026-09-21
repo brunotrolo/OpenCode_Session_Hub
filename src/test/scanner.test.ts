@@ -105,6 +105,61 @@ describe('session scanner across OpenCode storage generations', () => {
   });
 });
 
+describe('session scanner performance on a large database', () => {
+  it('computes message counts for many sessions with a single aggregate query, not one scan per session', () => {
+    // Regression guard for a real report: a correlated subquery
+    // (`SELECT COUNT(*) FROM message WHERE session_id = s.id` per session
+    // row) turned listing sessions into one full table scan PER SESSION —
+    // with ~150 sessions and a message table grown into the hundreds of
+    // thousands of rows, that blocked the whole extension host for a long
+    // time on every dashboard refresh. This doesn't assert query internals
+    // (out of reach from here), but building a database at a scale where
+    // the old N-scans behavior would be clearly, unmistakably slow, and
+    // asserting this stays fast, catches a regression back to it.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'osh-scan-perf-'));
+    try {
+      const machine = createMachine(root, 'work');
+      const dbPath = path.join(machine.dataRoot, 'opencode.db');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(dbPath);
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL,
+                 title TEXT NOT NULL, time_created INTEGER, time_updated INTEGER)`);
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                 time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`);
+
+      const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)');
+      const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)');
+
+      const sessionCount = 150;
+      const messagesPerSession = 50; // 7,500 message rows total — enough for an O(N) scan-per-session to be unmistakably slower
+      db.exec('BEGIN;');
+      for (let s = 0; s < sessionCount; s++) {
+        const sessionId = `ses_${s}`;
+        insertSession.run(sessionId, 'prj', '/work', `Session ${s}`, 1_700_000_000_000 + s, 1_700_000_000_000 + s);
+        for (let m = 0; m < messagesPerSession; m++) {
+          insertMessage.run(`msg_${s}_${m}`, sessionId, 1_700_000_000_000, 1_700_000_000_000, '{}');
+        }
+      }
+      db.exec('COMMIT;');
+      db.close();
+
+      const start = Date.now();
+      const { sessions } = scanSessions(resolveOpenCodeLocations(machine.env, 'linux'));
+      const elapsedMs = Date.now() - start;
+
+      assert.strictEqual(sessions.length, sessionCount);
+      assert.ok(
+        sessions.every((s) => s.messageCount === messagesPerSession),
+        'every session should report its correct message count'
+      );
+      assert.ok(elapsedMs < 2000, `expected the scan to stay fast; took ${elapsedMs}ms`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('path resolution', () => {
   it('uses XDG data home on Windows too, not LOCALAPPDATA', () => {
     const locations = resolveOpenCodeLocations(
