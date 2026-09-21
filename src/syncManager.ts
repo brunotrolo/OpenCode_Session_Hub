@@ -309,7 +309,7 @@ export class SyncManager {
       messages.push(...(await this.mirrorFavoriteSessions()));
     }
 
-    await this.git(['add', '-A']);
+    await this.gitAddAllWithRetry();
     const staged = (await this.git(['diff', '--cached', '--name-only'])).stdout.trim();
     if (staged) {
       await this.git(['commit', '-m', `sync: ${new Date().toISOString()}`]);
@@ -1050,6 +1050,42 @@ export class SyncManager {
     }
 
     return !(await tryCheckpointDatabase(filePath));
+  }
+
+  /**
+   * `git add -A` can transiently fail with "confused by unstable object
+   * source data" — git detects a working-tree file's size changing mid-hash
+   * and refuses to trust it, rather than commit something possibly
+   * inconsistent. This is a well-known Windows gotcha: antivirus (Windows
+   * Defender's real-time scanner especially) or a sync client like OneDrive
+   * briefly opening a file at the exact moment git is reading it produces
+   * exactly this symptom, even though nothing is actually wrong with the
+   * file — it's a momentary read race, not real corruption. Our own
+   * concurrency (SyncController's queue, atomic renames for exports) rules
+   * out this tool being the other reader, so a short retry — the same
+   * tolerance already given to individual locked-file copies — gives that
+   * external interference a chance to clear before treating it as a real
+   * failure.
+   */
+  private async gitAddAllWithRetry(): Promise<void> {
+    const delays = [0, 300, 800];
+    let lastError: unknown;
+    for (const delay of delays) {
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      try {
+        await this.git(['add', '-A']);
+        return;
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/confused by unstable object source data/i.test(message)) {
+          throw err; // A different failure — surface it immediately, don't mask it behind retries.
+        }
+      }
+    }
+    throw lastError instanceof SyncError ? lastError : new SyncError(String(lastError));
   }
 
   private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<GitResult> {

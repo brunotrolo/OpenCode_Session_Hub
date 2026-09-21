@@ -6,7 +6,7 @@ import * as path from 'path';
 import { after, before, describe, it } from 'node:test';
 import { resolveOpenCodeLocations } from '../opencodePaths';
 import { scanSessions } from '../sessionScanner';
-import { SyncManager, SyncSettings } from '../syncManager';
+import { SyncError, SyncManager, SyncSettings } from '../syncManager';
 import { addFavorite } from '../favorites';
 import { addSqliteSession, addStorageSession, createMachine, FakeMachine, writeJson } from './fixtures';
 
@@ -559,6 +559,74 @@ describe('two-machine sync simulation', () => {
       );
     } finally {
       visibilityModule.checkGitHubRepoPrivacy = original;
+    }
+  });
+
+  it('retries "git add -A" past a transient "confused by unstable object source data" failure', async () => {
+    // Real-world report: this exact git error on Windows, almost certainly
+    // antivirus or OneDrive briefly touching a file mid-hash — not real
+    // corruption. Patches SyncManager's private git() to simulate exactly
+    // that failure twice before succeeding, proving gitAddAllWithRetry
+    // recovers instead of failing the whole push.
+    const remoteForRetry = path.join(root, 'transient-add-failure-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remoteForRetry]);
+    const machine = createMachine(root, 'transient-add-failure');
+    addStorageSession(machine, {
+      projectId: 'prj_retry',
+      sessionId: 'ses_retry',
+      title: 'Should sync once the retry succeeds',
+      worktree: '/retry/project',
+    });
+    const manager = managerFor(machine, { remoteUrl: remoteForRetry });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const proto = SyncManager.prototype as any;
+    const originalGit = proto.git;
+    let addAttempts = 0;
+    proto.git = function patchedGit(this: unknown, args: string[], options?: unknown) {
+      if (args[0] === 'add') {
+        addAttempts += 1;
+        if (addAttempts <= 2) {
+          return Promise.reject(
+            new SyncError(`git add -A failed: fatal: confused by unstable object source data for deadbeef`)
+          );
+        }
+      }
+      return originalGit.call(this, args, options);
+    };
+
+    try {
+      const outcome = await manager.push();
+      assert.strictEqual(outcome.status, 'ok', outcome.messages.join(' | '));
+      assert.strictEqual(addAttempts, 3, 'expected exactly 2 simulated failures then a successful 3rd attempt');
+    } finally {
+      proto.git = originalGit;
+    }
+  });
+
+  it('does not retry "git add -A" on a genuinely different failure', async () => {
+    const remoteForFailure = path.join(root, 'real-add-failure-remote.git');
+    spawnSync('git', ['init', '--bare', '-b', 'main', remoteForFailure]);
+    const machine = createMachine(root, 'real-add-failure');
+    const manager = managerFor(machine, { remoteUrl: remoteForFailure });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const proto = SyncManager.prototype as any;
+    const originalGit = proto.git;
+    let addAttempts = 0;
+    proto.git = function patchedGit(this: unknown, args: string[], options?: unknown) {
+      if (args[0] === 'add') {
+        addAttempts += 1;
+        return Promise.reject(new SyncError('git add -A failed: fatal: something genuinely wrong'));
+      }
+      return originalGit.call(this, args, options);
+    };
+
+    try {
+      await assert.rejects(() => manager.push(), /something genuinely wrong/);
+      assert.strictEqual(addAttempts, 1, 'a non-transient failure must not be retried');
+    } finally {
+      proto.git = originalGit;
     }
   });
 

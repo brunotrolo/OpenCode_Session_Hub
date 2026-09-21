@@ -200,6 +200,17 @@ Key safety properties, implemented in `syncManager.ts`:
   age is the only signal available here — safe specifically because the size
   skip above means no legitimate operation should hold it anywhere near this
   long.
+- **Retries `git add -A` past "confused by unstable object source data"**
+  (`gitAddAllWithRetry`): a real-world Windows report hit this exact git
+  error repeatedly even after the concurrency queue (below) ruled out this
+  tool racing itself. It's a known Windows gotcha: antivirus (Windows
+  Defender's real-time scanner especially) or a sync client like OneDrive
+  briefly opening a working-tree file at the moment git is hashing it makes
+  git see the size change mid-read and refuse to trust it — not real
+  corruption, just a momentary external read race. A short retry (matching
+  the tolerance already given to individual locked-file copies) absorbs it;
+  any other `git add` failure surfaces immediately, never masked behind a
+  retry.
 - **Merge, not mirror, for session directories**: a file missing locally is
   never deleted from the repo, so one machine can't wipe another's history.
 - **Local-edit protection**: a file touched since this machine's last
