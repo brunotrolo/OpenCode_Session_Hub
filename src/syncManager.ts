@@ -799,7 +799,8 @@ export class SyncManager {
     return (
       `Skipped ${path.basename(filePath)}: ${actualMb} MB exceeds the ${limitMb} MB sync limit ` +
       '(GitHub rejects any single file over 100 MB, and git would spend real time hashing it first). ' +
-      'If this is opencode.db, try VACUUMing it or trimming old sessions.'
+      'If this is opencode.db, close OpenCode and run "Compact Database…" from the sidebar (or ' +
+      '"OpenCode Sync: Compact Database (VACUUM)") to shrink it, then sync again.'
     );
   }
 
