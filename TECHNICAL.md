@@ -79,20 +79,40 @@ both ways: config files/dirs, `~/.agents`, model favorites, and — only once
 `includeSecrets` + `privateRepoAcknowledged` are both true — session
 artifacts.
 
-## Per-session favorite sync
+## Per-session sync
 
 `opencode.db` is one file for the whole machine's history — if it's stuck
 over the sync size limit (see below), NOTHING in it reaches another machine
-until that's fixed. Favoriting a session (`favoriteSessionExport.ts`,
-wired into `syncManager.ts`'s `mirrorFavoriteSessions`/
-`applyFavoriteSessions`) routes around that: each favorited session is
-exported to its own file, `data/favorite-sessions/<sessionId>.db`, keyed by
-session id, independent of whether the whole-database sync ever succeeds.
+until that's fixed. Per-session export (`favoriteSessionExport.ts`, wired
+into `syncManager.ts`'s `mirrorFavoriteSessions`/`applyFavoriteSessions`)
+routes around that: a session is exported to its own file,
+`data/favorite-sessions/<sessionId>.db`, keyed by session id, independent of
+whether the whole-database sync ever succeeds.
 
-- **One file per session, not one blob.** A single favorite's export
+- **Favorites always; everything else when the database can't sync.**
+  Favorited sessions are exported on every push. When the whole-database
+  mirror was skipped (oversized, or OpenCode holding uncheckpointed
+  writes), per-session export is the *only* route session history has to
+  the remote, so it automatically covers every session — capped at
+  `MAX_INDIVIDUAL_SESSION_EXPORTS` (200), newest-updated first, with
+  favorites never counted against that cap. Without this, a user who never
+  bookmarked anything would sync config forever while not one session
+  reached the remote, with every push reporting success — which is exactly
+  what was reported.
+- **One file per session, not one blob.** A single session's export
   failing (session not found locally, unreadable, etc.) produces one skip
-  message and never blocks any other favorite — the opposite of the
+  message and never blocks any other — the opposite of the
   whole-database path, where one problem stops everything.
+- **Batched, and off the extension host.** OpenCode's schema has no index
+  on `session_id`, so every filtered read of `message`/`part` is a full
+  table scan: exporting one session at a time cost one scan *per session*
+  (~28s for 150 sessions, measured). `exportSessionFilesBatched` opens the
+  source once and scans each table once per chunk of 25 (~2s for the same
+  data). Because `node:sqlite` is fully synchronous, even that would block
+  the whole extension host, so `exportSessionFilesOffThread` runs it in a
+  child process that requires this same compiled module — one copy of the
+  logic, no freeze. If the child can't start it falls back to running
+  inline rather than silently syncing nothing.
 - **Reuses the row-level merge, not a separate import path.** The export
   copies each relevant table's *exact* `CREATE TABLE` statement out of the
   source database (`sqlite_master.sql`), so the resulting file has the
@@ -108,6 +128,31 @@ session id, independent of whether the whole-database sync ever succeeds.
   session is essentially never 90 MB, but a runaway one with huge tool
   output shouldn't reproduce the exact problem this feature exists to route
   around).
+- **Merged in one connection on the way back.** `applyFavoriteSessions`
+  uses `dbMerge.ts`'s `mergeManySessionDatabases`, which opens the target
+  `opencode.db` once for all incoming files. Merging one-connection-per-file
+  would checkpoint the WAL of a multi-GB database on every close — with a
+  few hundred files that alone stalls a pull.
+
+## Deleting a session (tombstones)
+
+Because every session can reach the repo as its own file, deleting one
+locally is not enough: the next pull would merge it straight back out of
+that still-present file, so Delete would silently undo itself.
+`deletedSessions.ts` records a tombstone (`config/opencode-session-hub-
+deleted-sessions.json`, synced like the favorites file) and
+`sessionScanner.ts`'s `deleteSession()` writes one on *every* delete path,
+so no caller can forget. A tombstone then:
+
+- removes that session's export file from the mirror, so the deletion
+  propagates to the other machines instead of being re-seeded by them;
+- excludes the session from future exports;
+- is skipped when merging incoming files; and
+- is **applied locally on pull** (`applyDeletedSessions`) — a session another
+  machine deleted is deleted here too. Without that last step the deletion
+  is only half-applied: this machine keeps the rows, the whole-database
+  mirror carries them back to the repo on the next push, and the deletion
+  bounces between the two machines forever.
 
 Key safety properties, implemented in `syncManager.ts`:
 
