@@ -2,3 +2,9 @@ out/
 node_modules/
 *.vsix
 .vscode-test/
+.agents/
+.claude/
+.impeccable/
+.sf/
+skills-lock.json
+PRODUCT.md

@@ -9,19 +9,24 @@ synced between machines through your own private Git repository.
 ## Features
 
 - **Sidebar panel** (Activity Bar icon, or **OpenCode: Open Session Hub
-  Panel**) — connection, schedule, security, live sync health, recent
-  sessions, and favorite sessions, all in one place.
+  Panel**) — a live sync-health card (Push / Pull / Refresh), recent
+  sessions with one-click actions, favorite sessions, and collapsible
+  Connection / Schedule / Security / Advanced sections, all in one place.
 - **Global session browser** (`OpenCode: List All Sessions`) — every
   session across every project, newest first. Resume, preview, open the
   folder, generate a handoff, or delete.
-- **Favorite sessions** — bookmark a session with your own comment so it's
-  easy to find later, even if it's scrolled out of the recent list. Each
+- **Session rows that explain themselves** — project directory, last
+  activity, message count, start date, and session ID on separate lines,
+  with a star to favorite and the title itself as the resume action.
+- **Favorite sessions** — star any session from its own row so it's easy
+  to find later, even if it's scrolled out of the recent list. Each
   favorited session also syncs on its own, one small file per session id —
   so it still reaches your other machines even while `opencode.db` itself
   is too large to sync (see TECHNICAL.md).
 - **Cross-machine sync** — pull on startup, push when the window loses
-  focus, or trigger manually. Session history only syncs once you confirm
-  the remote repository is private.
+  focus, or trigger manually from the status card (which also shows branch,
+  ahead/behind, last sync, and an inline Retry on failure). Session history
+  only syncs once you confirm the remote repository is private.
 - **Cross-OS path resolution** — resumes a session recorded on another
   machine even when the folder path is different there.
 - **Conversation preview** and **full-text search** across every session.

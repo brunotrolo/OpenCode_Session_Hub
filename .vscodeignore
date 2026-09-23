@@ -7,3 +7,11 @@ tsconfig.json
 package-lock.json
 OpenCode_Session_Hub.md
 **/*.map
+.agents/**
+.claude/**
+.impeccable/**
+.sf/**
+HANDOFF.md
+Nota.txt
+PRODUCT.md
+skills-lock.json

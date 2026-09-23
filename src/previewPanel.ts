@@ -31,10 +31,11 @@ export function renderHtml(record: SessionRecord, messages: SessionMessage[]): s
   body { font-family: var(--vscode-font-family); padding: 1rem; color: var(--vscode-foreground); }
   h1 { font-size: 1.1rem; margin-bottom: 0.25rem; }
   .meta { opacity: 0.7; margin-bottom: 1rem; font-size: 0.85rem; }
-  .msg { border-left: 3px solid var(--vscode-panel-border); padding-left: 0.75rem; margin-bottom: 1rem; }
-  .msg h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; margin: 0 0 0.35rem; }
-  .msg.user { border-left-color: var(--vscode-charts-blue); }
-  .msg.assistant { border-left-color: var(--vscode-charts-green); }
+  .msg { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.75rem; }
+  .msg h3 { font-size: 0.8rem; margin: 0 0 0.35rem; display: flex; align-items: center; gap: 0.4rem; }
+  .msg h3::before { content: ""; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--vscode-descriptionForeground); }
+  .msg.user h3::before { background: var(--vscode-charts-blue); }
+  .msg.assistant h3::before { background: var(--vscode-charts-green); }
   pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: var(--vscode-editor-font-family); }
 </style>
 </head>

@@ -274,6 +274,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         title: s.title,
         directory: s.directory,
         updatedAt: s.updatedAt,
+        createdAt: s.createdAt,
         messageCount: s.messageCount,
       })),
       sessionCount: sessions.length,
@@ -299,155 +300,297 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size);
     color: var(--vscode-foreground);
-    padding: 0 12px 16px;
+    padding: 0 12px 20px;
+    margin: 0;
   }
-  h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.75;
-       margin: 1.1rem 0 0.5rem; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 0.25rem; }
-  h2:first-of-type { margin-top: 0.75rem; }
-  label { display: block; font-size: 0.8rem; margin: 0.5rem 0 0.15rem; }
+  h2 { font-size: 11px; font-weight: 600; margin: 18px 0 8px; }
+  h2 .h2-action { float: right; font-weight: 400; }
+  label { display: block; font-size: 12px; margin: 8px 0 3px; }
   input[type="text"], input[type="number"] {
     width: 100%; box-sizing: border-box; background: var(--vscode-input-background);
     color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent);
-    padding: 3px 6px; border-radius: 2px; font-family: var(--vscode-editor-font-family);
+    padding: 4px 8px; border-radius: 2px; font-family: var(--vscode-editor-font-family); font-size: 12px;
   }
-  .checkbox-row { display: flex; align-items: center; gap: 6px; margin: 0.35rem 0; }
-  .checkbox-row label { margin: 0; font-size: 0.8rem; }
+  fieldset { border: none; margin: 0; padding: 0; }
+  .checkbox-row { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; }
+  .checkbox-row input { margin-top: 2px; }
+  .checkbox-row label { margin: 0; font-size: 12px; }
+  .checkbox-row .hint { display: block; font-size: 11px; opacity: 0.7; margin-top: 1px; }
   button {
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-    border: none; padding: 4px 10px; border-radius: 2px; cursor: pointer; font-size: 0.8rem;
+    border: none; padding: 5px 12px; border-radius: 2px; cursor: pointer; font-size: 12px;
+    font-family: var(--vscode-font-family);
   }
   button:hover { background: var(--vscode-button-hoverBackground); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:disabled:hover { background: var(--vscode-button-background); }
   button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 0.5rem; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.72rem; font-weight: 600; }
-  .badge-idle { background: var(--vscode-charts-green); color: #000; }
-  .badge-syncing { background: var(--vscode-charts-blue); color: #000; }
-  .badge-error { background: var(--vscode-errorForeground); color: #fff; }
-  .badge-conflict { background: var(--vscode-charts-orange); color: #000; }
-  .badge-unconfigured { background: var(--vscode-descriptionForeground); color: #fff; }
-  .health-line { font-size: 0.8rem; margin: 0.35rem 0; opacity: 0.9; }
+  button.secondary:disabled:hover { background: var(--vscode-button-secondaryBackground); }
+  button.mini { padding: 2px 8px; font-size: 11px; }
+  button.danger-text {
+    background: none; color: var(--vscode-errorForeground); padding: 2px 4px; font-size: 11px;
+  }
+  button.danger-text:hover { background: none; text-decoration: underline; }
+  button.linklike {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--vscode-textLink-foreground); font-size: 11px; font-family: var(--vscode-font-family);
+  }
+  button.linklike:hover { text-decoration: underline; }
+  button.title-link {
+    background: none; border: none; padding: 0; cursor: pointer; text-align: left;
+    color: var(--vscode-textLink-foreground); font-weight: 600; font-size: 13px;
+    font-family: var(--vscode-font-family);
+  }
+  button.title-link:hover { text-decoration: underline; }
+  button.star {
+    background: none; border: none; padding: 2px; cursor: pointer; flex: none;
+    color: var(--vscode-descriptionForeground); display: inline-flex; align-items: center;
+  }
+  button.star:hover { color: var(--vscode-foreground); }
+  button.star.on { color: var(--vscode-charts-yellow); }
+  :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  .status-card {
+    border: 1px solid var(--vscode-panel-border); border-radius: 6px;
+    padding: 10px 12px; margin-top: 12px;
+  }
+  .status-line { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot-idle { background: var(--vscode-charts-green); }
+  .dot-syncing { background: var(--vscode-charts-blue); }
+  .dot-error { background: var(--vscode-errorForeground); }
+  .dot-conflict { background: var(--vscode-charts-orange); }
+  .dot-unconfigured { background: var(--vscode-descriptionForeground); }
+  .sub { font-size: 12px; opacity: 0.85; margin-top: 5px; }
+  .outcome-ok { font-size: 12px; margin-top: 5px; color: var(--vscode-charts-green); }
+  .error-line { font-size: 12px; margin-top: 6px; color: var(--vscode-errorForeground); }
+  .row { display: flex; gap: 6px; margin-top: 10px; }
+  details.setup { border-top: 1px solid var(--vscode-panel-border); margin-top: 12px; padding-bottom: 4px; }
+  details.setup > summary { cursor: pointer; font-size: 11px; font-weight: 600; padding: 8px 0 2px; }
+  .desc { font-size: 12px; opacity: 0.8; margin: 2px 0 8px; }
+  .adv-item { margin: 10px 0; }
+  .adv-item p { font-size: 12px; opacity: 0.8; margin: 2px 0 6px; }
+  ul.sessions { list-style: none; margin: 0; padding: 0; }
+  ul.sessions li {
+    border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px;
+  }
+  .session-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .session-top .title-link { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta-dir {
+    font-size: 11px; opacity: 0.85; margin-top: 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .meta-line { font-size: 11px; opacity: 0.75; margin-top: 3px; }
+  .meta-id {
+    font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.75;
+    margin-top: 3px; word-break: break-all;
+  }
+  .mini-row { display: flex; gap: 6px; align-items: center; }
+  .fav-id { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.7; word-break: break-all; margin: 3px 0 8px; }
   .warning-banner {
     background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder);
-    padding: 6px 8px; border-radius: 3px; font-size: 0.78rem; margin: 0.4rem 0;
+    padding: 8px 10px; border-radius: 6px; font-size: 12px; margin: 8px 0;
   }
-  ul.sessions { list-style: none; margin: 0.4rem 0 0; padding: 0; }
-  ul.sessions li {
-    border: 1px solid var(--vscode-panel-border); border-radius: 3px; padding: 6px 8px; margin-bottom: 6px;
-  }
-  ul.sessions .title { font-weight: 600; font-size: 0.82rem; }
-  ul.sessions .meta { font-size: 0.72rem; opacity: 0.7; margin: 2px 0 6px; word-break: break-all; }
-  .empty { font-size: 0.8rem; opacity: 0.7; font-style: italic; }
+  .empty { font-size: 12px; opacity: 0.7; font-style: italic; }
 </style>
 </head>
 <body>
-  <h2>Health</h2>
-  <div id="health"></div>
-  <div class="row">
-    <button id="btn-push">Push Now</button>
-    <button id="btn-pull">Pull Now</button>
-    <button id="btn-refresh" class="secondary">Refresh</button>
-    <button id="btn-debug" class="secondary">Show Debug Info</button>
-    <button id="btn-compact-db" class="secondary">Compact Database…</button>
-    <button id="btn-rebuild-mirror" class="secondary">Rebuild Mirror…</button>
-  </div>
-  <div id="conflict-row" class="row" style="display:none">
-    <button id="btn-keep-local">Keep Local</button>
-    <button id="btn-keep-remote">Keep Remote</button>
+  <div class="status-card" aria-live="polite">
+    <div id="health"></div>
+    <div class="row">
+      <button id="btn-push">Push Now</button>
+      <button id="btn-pull" class="secondary">Pull Now</button>
+      <button id="btn-refresh" class="secondary">Refresh</button>
+    </div>
+    <div id="conflict-row" class="row" style="display:none">
+      <button id="btn-keep-local">Keep Local</button>
+      <button id="btn-keep-remote" class="secondary">Keep Remote</button>
+    </div>
   </div>
 
-  <h2>Connection</h2>
-  <label for="remoteUrl">Sync repository URL (private)</label>
-  <input id="remoteUrl" type="text" placeholder="git@github.com:you/my-opencode-config.git" />
-  <label for="branch">Branch</label>
-  <input id="branch" type="text" placeholder="main" />
-  <div class="row"><button id="btn-save-connection">Save Connection</button></div>
-
-  <h2>Schedule</h2>
-  <label for="debounceSeconds">Debounce before auto-push (seconds)</label>
-  <input id="debounceSeconds" type="number" min="1" />
-  <div class="checkbox-row"><input type="checkbox" id="autoPullOnStartup" /><label for="autoPullOnStartup">Pull on startup</label></div>
-  <div class="checkbox-row"><input type="checkbox" id="autoSyncOnFocusLost" /><label for="autoSyncOnFocusLost">Push when window loses focus</label></div>
-  <div class="row"><button id="btn-save-schedule">Save Schedule</button></div>
-
-  <h2>Security</h2>
-  <div class="checkbox-row"><input type="checkbox" id="includeSessions" /><label for="includeSessions">Sync session history</label></div>
-  <div class="checkbox-row"><input type="checkbox" id="includeSecrets" /><label for="includeSecrets">Allow secret-class data</label></div>
-  <div class="checkbox-row"><input type="checkbox" id="privateRepoAcknowledged" /><label for="privateRepoAcknowledged">I confirmed the remote repo is PRIVATE</label></div>
-  <div class="checkbox-row"><input type="checkbox" id="redactSecrets" /><label for="redactSecrets">Redact credential-shaped strings</label></div>
-  <div id="security-warning" class="warning-banner" style="display:none">
-    Session history will NOT sync until both boxes above are checked.
-  </div>
-  <div class="row"><button id="btn-save-security">Save Security</button></div>
-
-  <h2>Sessions (<span id="session-count">0</span> on this machine)</h2>
+  <h2>Sessions (<span id="session-count">0</span> on this machine)
+    <span class="h2-action"><button id="btn-open-list" class="linklike">Browse all…</button></span>
+  </h2>
   <div id="sessions"></div>
-  <div class="row"><button id="btn-open-list" class="secondary">Browse All Sessions…</button></div>
 
   <h2>Favorite Sessions</h2>
   <div id="favorites"></div>
-  <label for="favLabel">Comentario</label>
-  <input id="favLabel" type="text" placeholder="Sessao de Desenvolvimento de HTML Hello World" />
-  <label for="favSessionId">Session Id</label>
-  <input id="favSessionId" type="text" placeholder="ses_f4a55ea3effeDnzTiAaKbI0X92" />
-  <div class="row">
-    <button id="btn-save-favorite">Salvar</button>
-    <button id="btn-new-favorite" class="secondary">Incluir novo item</button>
-  </div>
+  <details id="fav-manual">
+    <summary style="font-size:11px;cursor:pointer;">Add favorite by session ID</summary>
+    <p class="desc">Only needed when the session is not listed above. Otherwise just use the star on its row.</p>
+    <label for="favLabel">Label</label>
+    <input id="favLabel" type="text" placeholder="e.g. Checkout redesign" />
+    <label for="favSessionId">Session ID</label>
+    <input id="favSessionId" type="text" placeholder="ses_…" />
+    <div class="row"><button id="btn-save-favorite">Save Favorite</button></div>
+  </details>
+
+  <details class="setup" id="setup-connection">
+    <summary>Connection</summary>
+    <p class="desc">Where this machine syncs to. Must be a private repository.</p>
+    <label for="remoteUrl">Sync repository URL (private)</label>
+    <input id="remoteUrl" type="text" placeholder="git@github.com:you/my-opencode-config.git" />
+    <label for="branch">Branch</label>
+    <input id="branch" type="text" placeholder="main" />
+    <div class="row"><button id="btn-save-connection">Save Connection</button></div>
+  </details>
+
+  <details class="setup" id="setup-schedule">
+    <summary>Schedule</summary>
+    <label for="debounceSeconds">Wait before auto-push (seconds)</label>
+    <input id="debounceSeconds" type="number" min="1" />
+    <div class="checkbox-row"><input type="checkbox" id="autoPullOnStartup" /><label for="autoPullOnStartup">Pull on startup</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="autoSyncOnFocusLost" /><label for="autoSyncOnFocusLost">Push when window loses focus</label></div>
+    <div class="row"><button id="btn-save-schedule">Save Schedule</button></div>
+  </details>
+
+  <details class="setup" id="setup-security">
+    <summary>Security</summary>
+    <p class="desc">Session history only syncs while both boxes are checked.</p>
+    <fieldset>
+      <div class="checkbox-row"><input type="checkbox" id="includeSessions" /><label for="includeSessions">Sync session history<span class="hint">Message content leaves this machine.</span></label></div>
+      <div class="checkbox-row"><input type="checkbox" id="includeSecrets" /><label for="includeSecrets">Allow secret-class data<span class="hint">Includes session content and credentials.</span></label></div>
+      <div class="checkbox-row"><input type="checkbox" id="privateRepoAcknowledged" /><label for="privateRepoAcknowledged">My remote repo is PRIVATE<span class="hint">Confirm this before enabling secrets.</span></label></div>
+      <div class="checkbox-row"><input type="checkbox" id="redactSecrets" /><label for="redactSecrets">Redact credentials<span class="hint">Replaces credential-shaped strings before syncing.</span></label></div>
+    </fieldset>
+    <div id="security-warning" class="warning-banner" style="display:none">
+      Session history stays on this machine until both boxes above are checked.
+    </div>
+    <div class="row"><button id="btn-save-security">Save Security</button></div>
+  </details>
+
+  <details class="setup" id="setup-advanced">
+    <summary>Advanced</summary>
+    <div class="adv-item">
+      <button id="btn-debug" class="secondary">Show Debug Info</button>
+      <p>Exactly what has been synced, and what was skipped.</p>
+    </div>
+    <div class="adv-item">
+      <button id="btn-compact-db" class="secondary">Compact Database…</button>
+      <p>Shrinks the local session database when it is too large to sync. Close OpenCode first.</p>
+    </div>
+    <div class="adv-item">
+      <button id="btn-rebuild-mirror" class="secondary">Rebuild Local Mirror…</button>
+      <p>Discards the local sync copy and clones it again from the remote. Your sessions are not touched.</p>
+    </div>
+  </details>
 
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
 
-  const badgeLabel = { idle: 'Synced', syncing: 'Syncing…', error: 'Error', conflict: 'Conflict', unconfigured: 'Not configured' };
+  const statusWord = { idle: 'Synced', syncing: 'Syncing…', error: 'Error', conflict: 'Conflict', unconfigured: 'Not configured' };
+
+  const STAR_OUTLINE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l2.7 5.6 6.1.8-4.5 4.2 1.1 6-5.4-3-5.4 3 1.1-6L3.2 9.4l6.1-.8z"/></svg>';
+  const STAR_FILLED = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l2.7 5.6 6.1.8-4.5 4.2 1.1 6-5.4-3-5.4 3 1.1-6L3.2 9.4l6.1-.8z"/></svg>';
 
   function escapeHtml(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Never clobber what the user is typing: background refreshes must not
+  // overwrite a focused field.
+  function setValue(id, value) {
+    const el = $(id);
+    if (el && document.activeElement !== el && el.value !== value) el.value = value;
+  }
+  function setChecked(id, value) {
+    const el = $(id);
+    if (el && document.activeElement !== el) el.checked = !!value;
   }
 
   function render(msg) {
     const { state, settings, schedule, sessions, sessionCount, favorites, warnings } = msg;
+    const favBySession = {};
+    (favorites || []).forEach((f) => { favBySession[f.sessionId] = f; });
 
-    $('health').innerHTML =
-      '<span class="badge badge-' + state.status + '">' + badgeLabel[state.status] + '</span>' +
-      (state.repoStatus ? '<div class="health-line">Branch ' + escapeHtml(state.repoStatus.branch) +
+    const busy = state.status === 'syncing';
+    const configured = state.status !== 'unconfigured';
+    $('btn-push').disabled = busy || !configured;
+    $('btn-pull').disabled = busy || !configured;
+
+    let health = '<div class="status-line"><span class="dot dot-' + state.status + '"></span>' +
+      statusWord[state.status] + '</div>';
+    if (state.repoStatus) {
+      health += '<div class="sub">Branch ' + escapeHtml(state.repoStatus.branch) +
         ' · ' + state.repoStatus.ahead + ' ahead · ' + state.repoStatus.behind + ' behind' +
-        (state.repoStatus.dirty ? ' · local changes pending' : '') + '</div>' : '') +
-      (state.lastSyncAt ? '<div class="health-line">Last sync: ' + new Date(state.lastSyncAt).toLocaleString() + '</div>' : '') +
-      (state.lastError ? '<div class="health-line" style="color:var(--vscode-errorForeground)">' + escapeHtml(state.lastError) + '</div>' : '') +
-      (state.lastOutcome && state.lastOutcome.messages.length
-        ? state.lastOutcome.messages.map((m) =>
-            '<div class="health-line"' +
-            (m.includes('Skipped') || m.includes('NOT synced') ? ' style="color:var(--vscode-errorForeground)"' : '') +
-            '>' + escapeHtml(m) + '</div>').join('') : '') +
-      (warnings || []).map((w) => '<div class="health-line" style="color:var(--vscode-errorForeground)">' + escapeHtml(w) + '</div>').join('');
+        (state.repoStatus.dirty ? ' · local changes pending' : '') + '</div>';
+    }
+    if (!configured) {
+      health += '<div class="sub">Save a connection below to start syncing.</div>';
+    }
+    if (busy) {
+      health += '<div class="sub">Syncing…</div>';
+    }
+    if (state.lastSyncAt) {
+      health += '<div class="sub">Last sync: ' + new Date(state.lastSyncAt).toLocaleString() + '</div>';
+    }
+    if (state.lastOutcome && state.lastOutcome.messages.length) {
+      health += state.lastOutcome.messages.map((m) =>
+        (m.includes('Skipped') || m.includes('NOT synced'))
+          ? '<div class="error-line">' + escapeHtml(m) + '</div>'
+          : '<div class="outcome-ok">' + escapeHtml(m) + '</div>').join('');
+    }
+    if (state.lastError) {
+      health += '<div class="error-line">' + escapeHtml(state.lastError) + '</div>' +
+        '<div class="row"><button id="btn-retry" class="secondary">Retry</button></div>';
+    }
+    health += (warnings || []).map((w) => '<div class="error-line">' + escapeHtml(w) + '</div>').join('');
+    $('health').innerHTML = health;
+    const retry = $('btn-retry');
+    if (retry) {
+      retry.addEventListener('click', () => {
+        const pendingPush = state.repoStatus && state.repoStatus.ahead > 0;
+        vscode.postMessage({ type: pendingPush ? 'push' : 'pull' });
+      });
+    }
 
     $('conflict-row').style.display = state.status === 'conflict' ? 'flex' : 'none';
 
-    $('remoteUrl').value = settings.remoteUrl || '';
-    $('branch').value = settings.branch || 'main';
-    $('debounceSeconds').value = schedule.debounceSeconds;
-    $('autoPullOnStartup').checked = schedule.autoPullOnStartup;
-    $('autoSyncOnFocusLost').checked = schedule.autoSyncOnFocusLost;
-    $('includeSessions').checked = settings.includeSessions;
-    $('includeSecrets').checked = settings.includeSecrets;
-    $('privateRepoAcknowledged').checked = settings.privateRepoAcknowledged;
-    $('redactSecrets').checked = settings.redactSecrets;
+    // Setup sections open themselves only while they block anything.
+    $('setup-connection').open = !configured;
+    $('setup-security').open = !!(settings.includeSessions &&
+      !(settings.includeSecrets && settings.privateRepoAcknowledged));
+
+    setValue('remoteUrl', settings.remoteUrl || '');
+    setValue('branch', settings.branch || 'main');
+    setValue('debounceSeconds', schedule.debounceSeconds);
+    setChecked('autoPullOnStartup', schedule.autoPullOnStartup);
+    setChecked('autoSyncOnFocusLost', schedule.autoSyncOnFocusLost);
+    setChecked('includeSessions', settings.includeSessions);
+    setChecked('includeSecrets', settings.includeSecrets);
+    setChecked('privateRepoAcknowledged', settings.privateRepoAcknowledged);
+    setChecked('redactSecrets', settings.redactSecrets);
     $('security-warning').style.display =
       settings.includeSessions && !(settings.includeSecrets && settings.privateRepoAcknowledged) ? 'block' : 'none';
 
     $('session-count').textContent = sessionCount;
     $('sessions').innerHTML = sessions.length
-      ? '<ul class="sessions">' + sessions.map((s) =>
-          '<li><div class="title">' + escapeHtml(s.title) + '</div>' +
-          '<div class="meta">' + escapeHtml(s.directory || 'unknown directory') + ' · ' +
-          (s.updatedAt ? new Date(s.updatedAt).toLocaleString() : '') + ' · ' + s.messageCount + ' messages</div>' +
-          '<div class="row">' +
-          '<button class="secondary" data-action="preview" data-id="' + escapeHtml(s.id) + '">Preview</button>' +
-          '<button class="secondary" data-action="resume" data-id="' + escapeHtml(s.id) + '">Resume</button>' +
-          '<button class="secondary" data-action="delete" data-id="' + escapeHtml(s.id) + '">Delete</button>' +
-          '</div></li>').join('') + '</ul>'
-      : '<p class="empty">No sessions found yet.</p>';
+      ? '<ul class="sessions">' + sessions.map((s) => {
+          const fav = favBySession[s.id];
+          const dir = s.directory || 'unknown directory';
+          const line = (s.updatedAt ? new Date(s.updatedAt).toLocaleString() : 'no date') +
+            ' · ' + s.messageCount + ' messages' +
+            (s.createdAt ? ' · started ' + new Date(s.createdAt).toLocaleDateString() : '');
+          return '<li><div class="session-top">' +
+            '<button class="star' + (fav ? ' on' : '') + '" data-star="1" data-sid="' + escapeHtml(s.id) + '"' +
+            (fav ? ' data-fav-id="' + escapeHtml(fav.id) + '"' : '') +
+            ' data-label="' + escapeHtml(s.title) + '"' +
+            ' title="' + (fav ? 'Remove from favorites' : 'Add to favorites') + '"' +
+            ' aria-pressed="' + (fav ? 'true' : 'false') + '" aria-label="' +
+            (fav ? 'Remove from favorites' : 'Add to favorites') + '">' +
+            (fav ? STAR_FILLED : STAR_OUTLINE) + '</button>' +
+            '<button class="title-link" data-action="resume" data-id="' + escapeHtml(s.id) + '"' +
+            ' title="Resume in a terminal">' + escapeHtml(s.title) + '</button></div>' +
+            '<div class="meta-dir" title="' + escapeHtml(dir) + '">' + escapeHtml(dir) + '</div>' +
+            '<div class="meta-line">' + escapeHtml(line) + '</div>' +
+            '<div class="meta-id" title="' + escapeHtml(s.id) + '">Session ID ' + escapeHtml(s.id) + '</div>' +
+            '<div class="mini-row" style="margin-top:8px">' +
+            '<button class="secondary mini" data-action="preview" data-id="' + escapeHtml(s.id) + '">Preview</button>' +
+            '<button class="danger-text" data-action="delete" data-id="' + escapeHtml(s.id) + '">Delete</button>' +
+            '</div></li>';
+        }).join('') + '</ul>'
+      : '<p class="empty">No sessions on this machine yet.</p>';
 
     const sessionActionMessage = { preview: 'previewSession', resume: 'resumeSession', delete: 'deleteSession' };
     document.querySelectorAll('[data-action]').forEach((btn) => {
@@ -457,17 +600,31 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: sessionActionMessage[action], id });
       });
     });
+    document.querySelectorAll('[data-star]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const favId = btn.getAttribute('data-fav-id');
+        if (favId) {
+          vscode.postMessage({ type: 'removeFavorite', id: favId });
+        } else {
+          vscode.postMessage({
+            type: 'saveFavorite',
+            label: btn.getAttribute('data-label') || btn.getAttribute('data-sid'),
+            sessionId: btn.getAttribute('data-sid'),
+          });
+        }
+      });
+    });
 
     $('favorites').innerHTML = (favorites || []).length
       ? '<ul class="sessions">' + favorites.map((f) =>
-          '<li><div class="title">' + escapeHtml(f.label) + '</div>' +
-          '<div class="meta">' + escapeHtml(f.sessionId) + '</div>' +
-          '<div class="row">' +
-          '<button class="secondary" data-fav-action="preview" data-session-id="' + escapeHtml(f.sessionId) + '">Preview</button>' +
-          '<button class="secondary" data-fav-action="resume" data-session-id="' + escapeHtml(f.sessionId) + '">Resume</button>' +
-          '<button class="secondary" data-fav-action="remove" data-id="' + escapeHtml(f.id) + '">Remover</button>' +
+          '<li><div class="title-link" style="cursor:default">' + escapeHtml(f.label) + '</div>' +
+          '<div class="fav-id">' + escapeHtml(f.sessionId) + '</div>' +
+          '<div class="mini-row">' +
+          '<button class="secondary mini" data-fav-action="preview" data-session-id="' + escapeHtml(f.sessionId) + '">Preview</button>' +
+          '<button class="secondary mini" data-fav-action="resume" data-session-id="' + escapeHtml(f.sessionId) + '">Resume</button>' +
+          '<button class="danger-text" data-fav-action="remove" data-id="' + escapeHtml(f.id) + '">Remove</button>' +
           '</div></li>').join('') + '</ul>'
-      : '<p class="empty">Nenhuma sessao favoritada ainda.</p>';
+      : '<p class="empty">No favorites yet — use the star on any session above.</p>';
 
     document.querySelectorAll('[data-fav-action]').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -522,14 +679,9 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     if (!sessionId) {
       return;
     }
-    vscode.postMessage({ type: 'saveFavorite', label: $('favLabel').value, sessionId });
+    vscode.postMessage({ type: 'saveFavorite', label: $('favLabel').value.trim() || sessionId, sessionId });
     $('favLabel').value = '';
     $('favSessionId').value = '';
-  });
-  $('btn-new-favorite').addEventListener('click', () => {
-    $('favLabel').value = '';
-    $('favSessionId').value = '';
-    $('favLabel').focus();
   });
 
   vscode.postMessage({ type: 'ready' });
