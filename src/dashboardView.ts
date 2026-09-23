@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { resolveLocalDirectory } from './pathMapper';
 import { showSessionPreview } from './previewPanel';
+import { showSessionManager } from './sessionManagerPanel';
 import { SessionRecord } from './sessionScanner';
 import { SyncController } from './syncController';
 import { SyncError } from './syncManager';
@@ -30,6 +31,7 @@ type Inbound =
   | { type: 'resumeSession'; id: string }
   | { type: 'deleteSession'; id: string }
   | { type: 'openFullList' }
+  | { type: 'openManager' }
   | { type: 'showDebugInfo' }
   | { type: 'compactDatabase' }
   | { type: 'rebuildMirror' }
@@ -132,6 +134,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
         case 'openFullList':
           await vscode.commands.executeCommand('opencodeSessionHub.listAllSessions');
+          return;
+
+        case 'openManager':
+          showSessionManager(this.controller);
           return;
 
         case 'showDebugInfo':
@@ -409,7 +415,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <h2>Sessions (<span id="session-count">0</span> on this machine)
-    <span class="h2-action"><button id="btn-open-list" class="linklike">Browse all…</button></span>
+    <span class="h2-action"><button id="btn-open-manager" class="linklike">Manage…</button>
+    · <button id="btn-open-list" class="linklike">Browse all…</button></span>
   </h2>
   <div id="sessions"></div>
 
@@ -530,6 +537,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         (m.includes('Skipped') || m.includes('NOT synced'))
           ? '<div class="error-line">' + escapeHtml(m) + '</div>'
           : '<div class="outcome-ok">' + escapeHtml(m) + '</div>').join('');
+      if (state.lastOutcome.messages.some((m) => m.includes('Skipped opencode.db'))) {
+        health += '<div class="row"><button id="btn-compact-inline" class="secondary">' +
+          'Close OpenCode, then Compact Database…</button></div>';
+      }
     }
     if (state.lastError) {
       health += '<div class="error-line">' + escapeHtml(state.lastError) + '</div>' +
@@ -543,6 +554,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         const pendingPush = state.repoStatus && state.repoStatus.ahead > 0;
         vscode.postMessage({ type: pendingPush ? 'push' : 'pull' });
       });
+    }
+    const compactInline = $('btn-compact-inline');
+    if (compactInline) {
+      compactInline.addEventListener('click', () => vscode.postMessage({ type: 'compactDatabase' }));
     }
 
     $('conflict-row').style.display = state.status === 'conflict' ? 'flex' : 'none';
@@ -652,6 +667,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
   $('btn-keep-local').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'local' }));
   $('btn-keep-remote').addEventListener('click', () => vscode.postMessage({ type: 'resolve', keep: 'remote' }));
   $('btn-open-list').addEventListener('click', () => vscode.postMessage({ type: 'openFullList' }));
+  $('btn-open-manager').addEventListener('click', () => vscode.postMessage({ type: 'openManager' }));
 
   $('btn-save-connection').addEventListener('click', () => {
     vscode.postMessage({ type: 'saveConnection', remoteUrl: $('remoteUrl').value, branch: $('branch').value });

@@ -4,6 +4,7 @@ import { generateHandoff } from './handoff';
 import { OpenCodeLocations } from './opencodePaths';
 import { resolveLocalDirectory } from './pathMapper';
 import { showSessionPreview } from './previewPanel';
+import { showSessionManager } from './sessionManagerPanel';
 import { loadMessages, SessionRecord } from './sessionScanner';
 import { SyncStatusBar } from './statusBar';
 import { SyncController } from './syncController';
@@ -29,6 +30,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand(name, handler));
 
   register('opencodeSessionHub.listAllSessions', () => listAllSessions());
+  register('opencodeSessionHub.manageSessions', () => showSessionManager(controller));
   register('opencodeSessionHub.previewSession', async () => {
     const locations = controller.getLocations();
     const record = await pickSession('Select a session to preview');

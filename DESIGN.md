@@ -22,5 +22,8 @@ Plain English verbs. Errors name the problem and the recovery ("Save a connectio
 ## Non-goals
 No motion, no custom scrollbars/selection (native editor chrome wins), no display type, no imagery — Operate surface in a 300px sidebar.
 
+## Session manager (`src/sessionManagerPanel.ts`)
+Full-page checklist sharing the panel's row grammar (three-line info, 1px cards): live text filter, select-all covering only visible rows, running selection count, one modal confirmation naming session and message totals, progress notification with per-session failure tolerance. Same red danger button as the panel's Delete row would shout; here it is the primary action, so it carries the fill.
+
 ## Activity icon (`media/activity-icon.svg`)
 Open sync ring (270°, gap NE) + filled hub node riding the ring + two session lines inside. Single 1.8px stroke, round caps, `currentColor` only — monochrome, no arrowheads, legible at 16px.

@@ -57,6 +57,10 @@
         "category": "OpenCode"
       },
       {
+        "command": "opencodeSessionHub.manageSessions",
+        "title": "OpenCode: Manage Sessions (Bulk Delete)"
+      },
+      {
         "command": "opencodeSessionHub.listAllSessions",
         "title": "OpenCode: List All Sessions (All Projects)"
       },

@@ -18,6 +18,11 @@ synced between machines through your own private Git repository.
 - **Session rows that explain themselves** — project directory, last
   activity, message count, start date, and session ID on separate lines,
   with a star to favorite and the title itself as the resume action.
+- **Session manager with bulk delete** (`OpenCode: Manage Sessions (Bulk
+  Delete)`, or **Manage…** in the sidebar) — every session with a
+  checkbox, a live filter, select-all, and one confirmed deletion for the
+  whole batch. Local-only like single delete: the sync repo and other
+  machines are untouched.
 - **Favorite sessions** — star any session from its own row so it's easy
   to find later, even if it's scrolled out of the recent list. Each
   favorited session also syncs on its own, one small file per session id —

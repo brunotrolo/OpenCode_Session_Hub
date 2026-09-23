@@ -3,6 +3,10 @@ export interface StubWebviewPanel {
   html: string;
   disposed: boolean;
   dispose(): void;
+  /** Messages the extension posted into the webview, in order. */
+  posted: unknown[];
+  /** Handler registered via webview.onDidReceiveMessage — drive the panel protocol through this. */
+  onMessage: ((message: unknown) => void) | undefined;
 }
 
 export interface StubState {
@@ -18,6 +22,8 @@ export interface StubState {
   statusBar: { text: string; tooltip: string; command: string };
   disposed: boolean;
   viewProviders: Map<string, unknown>;
+  /** What showOpenDialog resolves to — set to a folder to confirm a directory pick. */
+  openDialogPaths: { fsPath: string }[];
   /** Commands invoked via vscode.commands.executeCommand(...), in order. */
   executedCommands: string[];
   /** Lines written to the extension's output channel. */
@@ -39,6 +45,7 @@ export function installVscodeStub(): StubState {
     executedCommands: [],
     outputLines: [],
     viewProviders: new Map(),
+    openDialogPaths: [],
   };
 
   class EventEmitter<T> {
@@ -60,7 +67,7 @@ export function installVscodeStub(): StubState {
   const vscode = {
     ConfigurationTarget: { Global: 1, Workspace: 2 },
     StatusBarAlignment: { Left: 1, Right: 2 },
-    ViewColumn: { Beside: -2 },
+    ViewColumn: { One: 1, Beside: -2 },
     ProgressLocation: { Window: 10, Notification: 15 },
     EventEmitter,
     Uri: { file: (p: string) => ({ fsPath: p, scheme: 'file' }) },
@@ -122,6 +129,8 @@ export function installVscodeStub(): StubState {
           title,
           html: '',
           disposed: false,
+          posted: [],
+          onMessage: undefined,
           dispose: () => {
             if (panel.disposed) {
               return;
@@ -135,11 +144,20 @@ export function installVscodeStub(): StubState {
         state.webviews.push(panel);
         return {
           webview: {
+            options: {},
             get html() {
               return panel.html;
             },
             set html(v: string) {
               panel.html = v;
+            },
+            postMessage: async (msg: unknown) => {
+              panel.posted.push(msg);
+              return true;
+            },
+            onDidReceiveMessage: (cb: (m: unknown) => void) => {
+              panel.onMessage = cb;
+              return { dispose: () => undefined };
             },
           },
           reveal: () => undefined,
@@ -152,7 +170,7 @@ export function installVscodeStub(): StubState {
       },
       showQuickPick: async (items: unknown[], options: unknown) => state.quickPickResponder(items, options),
       showInputBox: async (options: unknown) => state.inputResponder(options),
-      showOpenDialog: async () => undefined,
+      showOpenDialog: async () => state.openDialogPaths,
       showInformationMessage: async (text: string) => {
         state.messages.push({ kind: 'info', text });
         return undefined;
