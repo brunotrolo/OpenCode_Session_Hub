@@ -21,7 +21,9 @@ synced between machines through your own private Git repository.
 - **Session manager with bulk delete** (`OpenCode: Manage Sessions (Bulk
   Delete)`, or **Manage…** in the sidebar) — every session with a
   checkbox, a live filter, select-all, and one confirmed deletion for the
-  whole batch. Local-only like single delete: the sync repo and other
+  whole batch. Filter by project or age, auto-select cleanup candidates,
+  delete all children of one parent by ID, or export the selection as
+  Markdown first. Local-only like single delete: the sync repo and other
   machines are untouched.
 - **Favorite sessions** — star any session from its own row so it's easy
   to find later, even if it's scrolled out of the recent list. Each
@@ -31,7 +33,9 @@ synced between machines through your own private Git repository.
 - **Cross-machine sync** — pull on startup, push when the window loses
   focus, or trigger manually from the status card (which also shows branch,
   ahead/behind, last sync, and an inline Retry on failure). Session history
-  only syncs once you confirm the remote repository is private.
+  only syncs once you confirm the remote repository is private. Child
+  sessions (forks, subagent runs) sync too unless `includeChildSessions`
+  is off.
 - **Cross-OS path resolution** — resumes a session recorded on another
   machine even when the folder path is different there.
 - **Conversation preview** and **full-text search** across every session.

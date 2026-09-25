@@ -11,9 +11,19 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'refresh' }
   | { type: 'deleteSelected'; ids: string[] }
-  | { type: 'previewSession'; id: string }
+  | { type: 'deleteChildren'; parentId: string }  | { type: 'previewSession'; id: string }
   | { type: 'resumeSession'; id: string }
   | { type: 'exportSelected'; ids: string[] };
+
+async function confirmBulkDelete(question: string): Promise<boolean> {
+  const choice = await vscode.window.showWarningMessage(
+    question +
+      ' This cannot be undone here, and will not remove them from the sync repository or other machines if they were already synced.',
+    { modal: true },
+    'Delete'
+  );
+  return choice === 'Delete';
+}
 
 /**
  * Full-page session manager: every session on this machine with a checkbox,
@@ -69,6 +79,7 @@ class SessionManagerView {
         createdAt: s.createdAt,
         messageCount: s.messageCount,
         synced: fs.existsSync(path.join(exportDir, `${s.id}.db`)),
+        ...(s.parentId ? { parentId: s.parentId } : {}),
       })),
     });
   }
@@ -82,6 +93,9 @@ class SessionManagerView {
           return;
         case 'deleteSelected':
           await this.deleteSelected(message.ids ?? []);
+          return;
+        case 'deleteChildren':
+          await this.deleteChildrenByParent(message.parentId ?? '');
           return;
         case 'previewSession':
           this.previewById(message.id);
@@ -106,15 +120,42 @@ class SessionManagerView {
       return;
     }
     const totalMessages = targets.reduce((n, r) => n + r.messageCount, 0);
-    const choice = await vscode.window.showWarningMessage(
-      `Delete ${targets.length} session(s) (${totalMessages} messages) from this machine? This cannot be undone here, ` +
-        `and will not remove them from the sync repository or other machines if they were already synced.`,
-      { modal: true },
-      'Delete'
+    const confirmed = await confirmBulkDelete(
+      `Delete ${targets.length} session(s) (${totalMessages} messages) from this machine?`
     );
-    if (choice !== 'Delete') {
+    if (!confirmed) {
       return;
     }
+    await this.deleteRecords(targets);
+  }
+
+  /**
+   * Deletes every child of one parent session and keeps the parent itself.
+   * Matching is by the recorded parentId, so it works even when the parent
+   * row is already gone and the children are orphaned.
+   */
+  private async deleteChildrenByParent(parentIdRaw: string): Promise<void> {
+    const parentId = parentIdRaw.trim();
+    if (!parentId) {
+      return;
+    }
+    const targets = [...this.records.values()].filter((r) => r.parentId === parentId);
+    if (targets.length === 0) {
+      vscode.window.showWarningMessage(`No child sessions of "${parentId}" found on this machine.`);
+      return;
+    }
+    const totalMessages = targets.reduce((n, r) => n + r.messageCount, 0);
+    const confirmed = await confirmBulkDelete(
+      `Delete ${targets.length} child session(s) of "${parentId}" (${totalMessages} messages) ` +
+        `from this machine, keeping the parent session itself?`
+    );
+    if (!confirmed) {
+      return;
+    }
+    await this.deleteRecords(targets);
+  }
+
+  private async deleteRecords(targets: SessionRecord[]): Promise<void> {
 
     const failures: string[] = [];
     await vscode.window.withProgress(
@@ -273,6 +314,10 @@ class SessionManagerView {
   .sync-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
   .sync-dot.synced { background: var(--vscode-charts-green); }
   .sync-dot.pending { background: var(--vscode-descriptionForeground); }
+  .fork-tag {
+    font-size: 10px; font-weight: 600; opacity: 0.75; border: 1px solid var(--vscode-panel-border);
+    border-radius: 8px; padding: 0 6px; flex: none;
+  }
   .dir { font-size: 11px; opacity: 0.85; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .line { font-size: 11px; opacity: 0.75; margin-top: 2px; }
   .sid { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.75; margin-top: 2px; word-break: break-all; }
@@ -303,6 +348,10 @@ class SessionManagerView {
       <button id="btn-cleanup-find" class="secondary">Select matching</button>
     </div>
     <div class="sub" id="cleanup-result"></div>
+    <div class="cleanup-row">
+      <label>Parent session ID<input id="children-parent-id" type="text" placeholder="ses_…" /></label>
+      <button id="btn-delete-children" class="danger">Delete children (keep parent)</button>
+    </div>
   </details>
   <div id="sessions"></div>
 
@@ -358,6 +407,7 @@ class SessionManagerView {
       '<div class="info"><div class="title"><span class="sync-dot ' + (s.synced ? 'synced' : 'pending') + '"' +
       ' title="' + (s.synced ? 'Synced to the remote repository' : 'Not synced yet') + '"></span>' +
       escapeHtml(s.title) + '</div>' +
+      (s.parentId ? '<div class="line"><span class="fork-tag" title="Forked from session ' + escapeHtml(s.parentId) + '">fork</span></div>' : '') +
       '<div class="dir" title="' + escapeHtml(dir) + '">' + escapeHtml(dir) + '</div>' +
       '<div class="line">' + escapeHtml(line) + '</div>' +
       '<div class="sid" title="' + escapeHtml(s.id) + '">Session ID ' + escapeHtml(s.id) + '</div>' +
@@ -446,6 +496,9 @@ class SessionManagerView {
   });
   $('btn-export').addEventListener('click', () => {
     vscode.postMessage({ type: 'exportSelected', ids: [...selected] });
+  });
+  $('btn-delete-children').addEventListener('click', () => {
+    vscode.postMessage({ type: 'deleteChildren', parentId: $('children-parent-id').value });
   });
   $('select-all').addEventListener('change', (e) => {
     const on = e.target.checked;

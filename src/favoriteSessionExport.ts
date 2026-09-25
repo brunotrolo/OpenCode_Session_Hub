@@ -120,6 +120,12 @@ async function moveIntoPlace(tmpPath: string, outputPath: string): Promise<void>
 export interface BatchExportEntry {
   sessionId: string;
   outputPath: string;
+  /**
+   * 'legacy' reads the session/message/part row tables; 'event' reads the
+   * event-log tables newer OpenCode actually writes to. Absent means legacy,
+   * which keeps older callers (and their tests) compiling and behaving.
+   */
+  format?: 'legacy' | 'event';
 }
 
 export type BatchExportResult = { sessionId: string } & ExportResult;
@@ -233,9 +239,17 @@ export async function exportSessionFilesBatched(
 
   const results: BatchExportResult[] = [];
   try {
-    for (let offset = 0; offset < entries.length; offset += EXPORT_CHUNK_SIZE) {
-      const chunk = entries.slice(offset, offset + EXPORT_CHUNK_SIZE);
+    const legacy = entries.filter((entry) => entry.format !== 'event');
+    for (let offset = 0; offset < legacy.length; offset += EXPORT_CHUNK_SIZE) {
+      const chunk = legacy.slice(offset, offset + EXPORT_CHUNK_SIZE);
       results.push(...(await exportChunk(DatabaseSync, source, chunk)));
+    }
+    // Event rows are keyed by an index OpenCode ships
+    // ((aggregate_id, type, seq)), so per-session reads stay cheap without
+    // any chunking discipline — one indexed pass per session, not per table.
+    const events = entries.filter((entry) => entry.format === 'event');
+    if (events.length > 0) {
+      results.push(...(await exportEventEntries(DatabaseSync, source, events)));
     }
   } finally {
     try {
@@ -245,6 +259,102 @@ export async function exportSessionFilesBatched(
     }
   }
 
+  // Callers match results back by session id (see the per-session
+  // independence note above), so restore the input order.
+  const byId = new Map(results.map((result) => [result.sessionId, result]));
+  return entries.map(
+    (entry) =>
+      byId.get(entry.sessionId) ?? {
+        sessionId: entry.sessionId,
+        ok: false as const,
+        error: 'export produced no result for this session',
+      }
+  );
+}
+
+/**
+ * Exports event-log sessions the same one-file-per-session way the legacy
+ * path does: each file carries only its aggregate's rows from the `event`
+ * and `event_sequence` tables, created with the source's own CREATE TABLE
+ * statements so dbMerge can merge them into another machine with no
+ * separate import logic.
+ */
+async function exportEventEntries(
+  DatabaseSync: new (p: string, o?: Record<string, unknown>) => ExportHandle,
+  source: ExportHandle,
+  entries: BatchExportEntry[]
+): Promise<BatchExportResult[]> {
+  const eventSchema = readTableSchema(source, 'event');
+  if (!eventSchema) {
+    return entries.map((entry) => ({
+      sessionId: entry.sessionId,
+      ok: false as const,
+      error: 'this database has no event log to export from',
+    }));
+  }
+  const sequenceSchema = readTableSchema(source, 'event_sequence');
+
+  const results: BatchExportResult[] = [];
+  for (const entry of entries) {
+    let eventRows: Record<string, unknown>[];
+    let sequenceRows: Record<string, unknown>[];
+    try {
+      eventRows = source
+        .prepare(
+          `SELECT ${eventSchema.columns.map(quoteIdent).join(', ')} FROM "event" WHERE "aggregate_id" = ? ORDER BY "seq" ASC`
+        )
+        .all(entry.sessionId);
+      sequenceRows = sequenceSchema
+        ? source
+            .prepare(
+              `SELECT ${sequenceSchema.columns.map(quoteIdent).join(', ')} FROM "event_sequence" WHERE "aggregate_id" = ?`
+            )
+            .all(entry.sessionId)
+        : [];
+    } catch (err) {
+      results.push({ sessionId: entry.sessionId, ok: false, error: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
+    if (eventRows.length === 0 && sequenceRows.length === 0) {
+      results.push({
+        sessionId: entry.sessionId,
+        ok: false,
+        error: `session ${entry.sessionId} not found in opencode.db on this machine`,
+      });
+      continue;
+    }
+
+    const tmpPath = scratchPathFor(entry.outputPath);
+    let output: ExportHandle | undefined;
+    try {
+      await fs.promises.rm(tmpPath, { force: true });
+      output = new DatabaseSync(tmpPath);
+      // Transport file, not a live database: no FK enforcement. (With
+      // node:sqlite's default FK-on behavior, inserting event rows before
+      // their sequence row exists fails with a misleading "no such table:
+      // main.event_sequence" — the sequence row is written first anyway,
+      // this just makes the ordering unobservable.)
+      output.exec('PRAGMA foreign_keys = OFF;');
+      let rows = 0;
+      if (sequenceSchema) {
+        rows += writeRows(output, 'event_sequence', sequenceSchema, sequenceRows);
+      }
+      rows += writeRows(output, 'event', eventSchema, eventRows);
+      output.close();
+      output = undefined;
+      await moveIntoPlace(tmpPath, entry.outputPath);
+      results.push({ sessionId: entry.sessionId, ok: true, rows });
+    } catch (err) {
+      results.push({ sessionId: entry.sessionId, ok: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      try {
+        output?.close();
+      } catch {
+        // ignore
+      }
+      await fs.promises.rm(tmpPath, { force: true }).catch(() => undefined);
+    }
+  }
   return results;
 }
 
@@ -538,4 +648,137 @@ function copyMatchingRows(
 /** Table/column names here always come from PRAGMA table_info / sqlite_master of OpenCode's own schema, never external input — quoting only guards against reserved words. */
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
+}
+
+export interface TruncateResult {
+  ok: boolean;
+  /** Messages kept (message.updated events), for the sync note. */
+  keptMessages: number;
+  droppedMessages: number;
+  bytes: number;
+  error?: string;
+}
+
+/**
+ * Shrinks an event-format export file to fit `budgetBytes` by dropping the
+ * OLDEST message/part events first — newest context survives, which is what
+ * a resumed session needs most. Always keeps the session.created event, the
+ * latest session.updated event (title/directory live there) and the
+ * sequence row. VACUUMs afterward because deleting alone never shrinks a
+ * SQLite file. One truncated file still merges anywhere a full one does.
+ */
+export async function truncateEventExport(outputPath: string, budgetBytes: number): Promise<TruncateResult> {
+  let DatabaseSync: new (p: string, o?: Record<string, unknown>) => ExportHandle;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return { ok: false, keptMessages: 0, droppedMessages: 0, bytes: 0, error: 'node:sqlite unavailable' };
+  }
+
+  let db: ExportHandle;
+  try {
+    db = new DatabaseSync(outputPath);
+  } catch (err) {
+    return {
+      ok: false,
+      keptMessages: 0,
+      droppedMessages: 0,
+      bytes: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  try {
+    const totalMessages = Number(
+      db.prepare("SELECT COUNT(*) AS n FROM \"event\" WHERE \"type\" = 'message.updated.1'").all()[0]?.n ?? 0
+    );
+    // Page slack and indexes mean file bytes always exceed raw data bytes.
+    // Measure that overhead from the file itself so the keep-budget below
+    // is in data bytes but lands the file under the byte budget.
+    const dataBytes = Number(db.prepare('SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM "event"').all()[0]?.n ?? 0);
+    let overhead = Math.max(0, fs.statSync(outputPath).size - dataBytes);
+    for (let round = 0; round < 3; round += 1) {
+      const rows = db
+        .prepare('SELECT seq AS seq, type AS type, LENGTH(data) AS size FROM "event" ORDER BY seq DESC')
+        .all();
+      if (rows.length === 0) {
+        return { ok: false, keptMessages: 0, droppedMessages: totalMessages, bytes: 0, error: 'export file has no events' };
+      }
+
+      // Anchor rows survive every round: creation, latest session state.
+      const created = rows.filter((row) => row.type === 'session.created.1').map((row) => Number(row.seq));
+      const updated = rows.filter((row) => row.type === 'session.updated.1').map((row) => Number(row.seq));
+      const keepSeqs = new Set<number>([...created.slice(0, 1), ...updated.slice(-1)]);
+      // One page of margin: a file can never be smaller than its pages.
+      let keepBudget = budgetBytes - overhead - 4096;
+      let keptBytes = rows
+        .filter((row) => keepSeqs.has(Number(row.seq)))
+        .reduce((n, row) => n + Number(row.size ?? 0), 0);
+      let cutoff = -1;
+      for (const row of rows) {
+        const seq = Number(row.seq);
+        if (keepSeqs.has(seq)) {
+          continue;
+        }
+        if (row.type !== 'message.updated.1' && row.type !== 'message.part.updated.1') {
+          keepSeqs.add(seq);
+          keptBytes += Number(row.size ?? 0);
+          continue;
+        }
+        if (keptBytes + Number(row.size ?? 0) > keepBudget) {
+          cutoff = seq;
+          break;
+        }
+        keepSeqs.add(seq);
+        keptBytes += Number(row.size ?? 0);
+      }
+
+      if (cutoff === -1) {
+        break; // Everything already fits.
+      }
+      const before = (
+        db.prepare("SELECT COUNT(*) AS n FROM \"event\" WHERE \"type\" = 'message.updated.1'").all()[0] as {
+          n: number;
+        }
+      ).n;
+      db.prepare(`DELETE FROM "event" WHERE "seq" < ? AND "type" IN ('message.updated.1', 'message.part.updated.1')`).run(
+        cutoff
+      );
+      db.exec('VACUUM;');
+      const afterBytes = fs.statSync(outputPath).size;
+      if (afterBytes <= budgetBytes) {
+        break;
+      }
+      // Re-measure: the next round budgets from the compacted reality.
+      const remaining = Number(db.prepare('SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM "event"').all()[0]?.n ?? 0);
+      overhead = Math.max(0, afterBytes - remaining);
+      const remainingMessages = Number(
+        db.prepare("SELECT COUNT(*) AS n FROM \"event\" WHERE \"type\" = 'message.updated.1'").all()[0]?.n ?? 0
+      );
+      if (remainingMessages >= before) {
+        break; // No progress possible: anchors alone exceed the budget.
+      }
+    }
+
+    const bytes = fs.statSync(outputPath).size;
+    const keptMessages = Number(
+      db.prepare("SELECT COUNT(*) AS n FROM \"event\" WHERE \"type\" = 'message.updated.1'").all()[0]?.n ?? 0
+    );
+    return { ok: bytes <= budgetBytes, keptMessages, droppedMessages: totalMessages - keptMessages, bytes };
+  } catch (err) {
+    return {
+      ok: false,
+      keptMessages: 0,
+      droppedMessages: 0,
+      bytes: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+  }
 }

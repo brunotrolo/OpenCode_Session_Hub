@@ -12,7 +12,8 @@ three and de-duplicates by session id, newest generation winning:
 
 | Generation | Location |
 | --- | --- |
-| SQLite | `~/.local/share/opencode/opencode.db` |
+| Event log | `event` table in `~/.local/share/opencode/opencode.db` (`session.created/updated`, `message.updated`, `message.part.updated` events keyed by `aggregate_id`) |
+| SQLite | `~/.local/share/opencode/opencode.db`, `session`/`message`/`part` row tables (stale leftovers once the event log exists) |
 | Storage JSON | `~/.local/share/opencode/storage/session/<projectID>/<sessionID>.json` |
 | Legacy JSON | `~/.local/share/opencode/project/<hash>/storage/session/info/<sessionID>.json` |
 
@@ -118,7 +119,10 @@ whether the whole-database sync ever succeeds.
   source database (`sqlite_master.sql`), so the resulting file has the
   correct real schema — `dbMerge.ts`'s `mergeSessionDatabases()` can then
   merge it into another machine's `opencode.db` with zero session-specific
-  code. On a genuinely fresh machine with no `opencode.db` yet (merge needs
+  code. Event-log sessions export the same way, but from the `event` /
+  `event_sequence` tables (one indexed pass per aggregate), and merge back
+  by event id with the higher sequence winning — so both storage generations
+  round-trip through the same files. On a genuinely fresh machine with no `opencode.db` yet (merge needs
   the target's tables to already exist), the first favorite file applied
   bootstraps it via a plain copy; the rest merge into that.
 - **Same privacy gate as full session sync**: only exported when

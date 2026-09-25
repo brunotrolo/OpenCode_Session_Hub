@@ -4,6 +4,7 @@
   "description": "Browse every OpenCode session on your machine and keep them synced across workstations via a private Git repository.",
   "version": "0.2.0",
   "publisher": "opencode-session-hub",
+  "icon": "media/extension-icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/brunotrolo/OpenCode_Session_Hub.git"
@@ -138,6 +139,11 @@
           "type": "boolean",
           "default": true,
           "description": "Sync OpenCode session history (opencode.db and storage/session|message|part). Also requires includeSecrets + privateRepoAcknowledged."
+        },
+        "opencodeSessionHub.includeChildSessions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also sync child sessions (forks and subagent runs). Turn off to keep only top-level sessions in the sync repository."
         },
         "opencodeSessionHub.includeModelFavorites": {
           "type": "boolean",

@@ -121,6 +121,7 @@ export function addSqliteSession(
     title: string;
     directory: string;
     updated: number;
+    parentId?: string;
     messages?: { id: string; role: string; text: string; created: number }[];
   }
 ): void {
@@ -149,7 +150,7 @@ export function addSqliteSession(
   db.prepare('INSERT OR REPLACE INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
     options.sessionId,
     options.projectId,
-    null,
+    options.parentId ?? null,
     'slug',
     options.directory,
     options.title,
@@ -176,5 +177,81 @@ export function addSqliteSession(
     );
   }
 
+  db.close();
+}
+
+/** Current event-log layout: sessions as session.created/updated events, messages as message/parts events. */
+export function addEventSession(
+  machine: FakeMachine,
+  options: {
+    sessionId: string;
+    title: string;
+    directory: string;
+    projectId?: string;
+    parentId?: string;
+    updated: number;
+    messages?: { id: string; role: string; text: string; created: number }[];
+  }
+): void {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(path.join(machine.dataRoot, 'opencode.db'));
+
+  db.exec(`CREATE TABLE IF NOT EXISTS event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL,
+             seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL,
+             CONSTRAINT fk_event_aggregate FOREIGN KEY (aggregate_id)
+               REFERENCES event_sequence (aggregate_id) ON DELETE CASCADE)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS event_aggregate_seq_idx ON event (aggregate_id, seq)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT)`);
+
+  const maxRow = db.prepare('SELECT MAX(seq) AS m FROM event WHERE aggregate_id = ?').all(options.sessionId)[0] as {
+    m: number | null;
+  };
+  let seq = Number(maxRow?.m ?? -1) + 1;
+  const insert = db.prepare('INSERT OR REPLACE INTO event VALUES (?, ?, ?, ?, ?)');
+  // The FK from event to event_sequence is enforced, so the sequence row
+  // must exist before any event row referencing the aggregate.
+  db.prepare('INSERT OR IGNORE INTO event_sequence VALUES (?, ?, ?)').run(options.sessionId, seq, null);
+  const evt = (type: string, data: unknown) => {
+    insert.run(`evt_${options.sessionId}_${seq}`, options.sessionId, seq, type, JSON.stringify(data));
+    seq += 1;
+  };
+
+  const baseInfo = {
+    id: options.sessionId,
+    projectID: options.projectId ?? 'prj_event',
+    directory: options.directory,
+    title: options.title,
+    version: '1.18.3',
+    time: { created: 1_700_000_000_000, updated: 1_700_000_000_000 },
+    ...(options.parentId ? { parentID: options.parentId } : {}),
+  };
+  evt('session.created.1', { sessionID: options.sessionId, info: baseInfo });
+  evt('session.updated.1', {
+    sessionID: options.sessionId,
+    info: { ...baseInfo, time: { created: 1_700_000_000_000, updated: options.updated } },
+  });
+
+  for (const message of options.messages ?? []) {
+    evt('message.updated.1', {
+      sessionID: options.sessionId,
+      info: { id: message.id, sessionID: options.sessionId, role: message.role, time: { created: message.created } },
+    });
+    evt('message.part.updated.1', {
+      sessionID: options.sessionId,
+      part: {
+        id: `prt_${message.id}`,
+        sessionID: options.sessionId,
+        messageID: message.id,
+        type: 'text',
+        text: message.text,
+      },
+      time: message.created,
+    });
+  }
+
+  // UPDATE, never REPLACE: replacing the sequence row fires its ON DELETE
+  // CASCADE and wipes the events just inserted.
+  db.prepare('UPDATE event_sequence SET seq = ? WHERE aggregate_id = ?').run(seq, options.sessionId);
   db.close();
 }

@@ -167,12 +167,14 @@ describe('sidebar dashboard', () => {
       includeSecrets: true,
       privateRepoAcknowledged: true,
       includeSessions: true,
+      includeChildSessions: false,
       redactSecrets: true,
     });
 
     const state = latestState();
     assert.strictEqual(state.settings.includeSecrets, true);
     assert.strictEqual(state.settings.privateRepoAcknowledged, true);
+    assert.strictEqual(state.settings.includeChildSessions, false);
   });
 
   it('saving the schedule persists debounce and toggle settings', async () => {

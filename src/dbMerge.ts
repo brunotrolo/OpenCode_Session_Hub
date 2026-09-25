@@ -22,6 +22,13 @@ interface SqliteHandle {
 
 /** Every table in opencode.db worth merging; each has both time columns per OpenCode's own schema. */
 const MERGE_TABLES = ['project', 'session', 'message', 'part'];
+/**
+ * The event log merges row-by-row like everything else: event ids are
+ * globally unique, so INSERT wins for new rows and the newer time_updated
+ * wins on the rare id collision — mergeTable already implements exactly
+ * that, since event rows carry id + time_updated like every other table.
+ */
+const EVENT_MERGE_TABLES = ['event'];
 const UPDATED_COLUMN_CANDIDATES = ['time_updated', 'time_created'];
 
 /**
@@ -51,7 +58,13 @@ export function mergeSessionDatabases(targetPath: string, sourcePath: string): n
     let changed = 0;
     target.exec('BEGIN;');
     try {
+      // Sequence counters first: with FK enforcement on, event rows cannot
+      // land before their aggregate's sequence row exists.
+      changed += mergeEventSequence(target, source);
       for (const table of MERGE_TABLES) {
+        changed += mergeTable(target, source, table);
+      }
+      for (const table of EVENT_MERGE_TABLES) {
         changed += mergeTable(target, source, table);
       }
       target.exec('COMMIT;');
@@ -118,7 +131,13 @@ export function mergeManySessionDatabases(
         let changed = 0;
         target.exec('BEGIN;');
         try {
+          // Sequence counters first: with FK enforcement on, event rows cannot
+          // land before their aggregate's sequence row exists.
+          changed += mergeEventSequence(target, source);
           for (const table of MERGE_TABLES) {
+            changed += mergeTable(target, source, table);
+          }
+          for (const table of EVENT_MERGE_TABLES) {
             changed += mergeTable(target, source, table);
           }
           target.exec('COMMIT;');
@@ -202,6 +221,53 @@ function mergeTable(target: SqliteHandle, source: SqliteHandle, table: string): 
       update.run(...nonIdColumns.map((c) => row[c]), row.id);
       changed++;
     }
+  }
+  return changed;
+}
+
+/**
+ * Merges per-session sequence counters: a row the target lacks is copied,
+ * and when both sides have the aggregate the higher seq wins (it names the
+ * newest event either side has seen). Missing table on either side merges
+ * as zero, like mergeTable — older schemas without an event log pass
+ * through untouched.
+ */
+function mergeEventSequence(target: SqliteHandle, source: SqliteHandle): number {
+  let targetColumns: string[];
+  let sourceColumns: string[];
+  try {
+    targetColumns = tableColumns(target, 'event_sequence');
+    sourceColumns = tableColumns(source, 'event_sequence');
+  } catch {
+    return 0;
+  }
+  const columns = targetColumns.filter((c) => sourceColumns.includes(c));
+  if (!columns.includes('aggregate_id') || !columns.includes('seq')) {
+    return 0;
+  }
+
+  const columnList = columns.map(quoteIdent).join(', ');
+  let changed = 0;
+  try {
+    const sourceRows = source.prepare(`SELECT ${columnList} FROM "event_sequence"`).all();
+    const getExisting = target.prepare('SELECT seq FROM "event_sequence" WHERE aggregate_id = ?');
+    const insert = target.prepare(
+      `INSERT INTO "event_sequence" (${columnList}) VALUES (${columns.map(() => '?').join(', ')})`
+    );
+    const bump = target.prepare('UPDATE "event_sequence" SET seq = ? WHERE aggregate_id = ?');
+    for (const row of sourceRows) {
+      const aggregateId = row.aggregate_id;
+      const existing = getExisting.get(aggregateId) as { seq?: unknown } | undefined;
+      if (!existing) {
+        insert.run(...columns.map((c) => row[c]));
+        changed++;
+      } else if (Number(row.seq ?? 0) > Number(existing.seq ?? 0)) {
+        bump.run(row.seq, aggregateId);
+        changed++;
+      }
+    }
+  } catch {
+    return changed;
   }
   return changed;
 }

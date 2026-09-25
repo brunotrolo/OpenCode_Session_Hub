@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { after, before, beforeEach, describe, it } from 'node:test';
-import { addStorageSession, createMachine, FakeMachine } from './fixtures';
+import { addEventSession, addStorageSession, createMachine, FakeMachine } from './fixtures';
 import { installVscodeStub, StubState, StubWebviewPanel } from './vscodeStub';
 
 /**
@@ -176,5 +176,45 @@ describe('session manager (bulk delete)', () => {
     await panel.onMessage!({ type: 'exportSelected', ids: ['ses_bulk2'] });
 
     assert.strictEqual(fs.readdirSync(exportDir).length, 0);
+  });
+
+  it('deletes every child of a parent id and keeps the parent itself', async () => {
+    addEventSession(machine, {
+      sessionId: 'ses_kid_parent',
+      title: 'Kid parent',
+      directory: demoDir,
+      updated: 1_700_000_400_000,
+    });
+    for (const n of [1, 2]) {
+      addEventSession(machine, {
+        sessionId: `ses_kid_child${n}`,
+        title: `Kid child ${n}`,
+        directory: demoDir,
+        parentId: 'ses_kid_parent',
+        updated: 1_700_000_400_000 + n,
+      });
+    }
+    stub.warningResponder = () => 'Delete';
+    stub.messages.length = 0;
+    await panel.onMessage!({ type: 'ready' });
+    await panel.onMessage!({ type: 'deleteChildren', parentId: 'ses_kid_parent' });
+
+    const ids = latestState().sessions.map((s: { id: string }) => s.id);
+    assert.ok(ids.includes('ses_kid_parent'), 'the parent must survive');
+    assert.ok(!ids.includes('ses_kid_child1') && !ids.includes('ses_kid_child2'), 'all children must go');
+    assert.ok(
+      stub.messages.some((m) => m.kind === 'info' && m.text.includes('Deleted 2 session(s)')),
+      `expected a bulk-delete confirmation, got: ${JSON.stringify(stub.messages)}`
+    );
+  });
+
+  it('warns and deletes nothing when a parent id has no children', async () => {
+    stub.messages.length = 0;
+    await panel.onMessage!({ type: 'ready' });
+    const before = latestState().sessions.length;
+    await panel.onMessage!({ type: 'deleteChildren', parentId: 'ses_no_such_parent' });
+
+    assert.strictEqual(latestState().sessions.length, before);
+    assert.ok(stub.messages.some((m) => m.kind === 'warn' && m.text.includes('No child sessions')));
   });
 });

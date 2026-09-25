@@ -11,7 +11,7 @@ export interface SessionMessage {
   createdAt: number;
 }
 
-export type SessionSource = 'sqlite' | 'storage-json' | 'legacy-json';
+export type SessionSource = 'sqlite' | 'storage-json' | 'legacy-json' | 'event-log';
 
 export interface SessionRecord {
   id: string;
@@ -23,6 +23,8 @@ export interface SessionRecord {
   updatedAt: number;
   messageCount: number;
   source: SessionSource;
+  /** Set when this session was forked or spawned from another one (OpenCode parentID). */
+  parentId?: string;
 }
 
 export interface ScanResult {
@@ -62,6 +64,14 @@ export function scanSessions(locations: OpenCodeLocations): ScanResult {
   }
   warnings.push(...sqlite.warnings);
 
+  // Current generation last: on id collisions the live event log wins over
+  // stale rows earlier generations left behind.
+  const events = readEventSessions(locations.databasePath);
+  for (const record of events.sessions) {
+    byId.set(record.id, record);
+  }
+  warnings.push(...events.warnings);
+
   const sessions = [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
   return { sessions, warnings };
 }
@@ -74,6 +84,8 @@ export function loadMessages(locations: OpenCodeLocations, record: SessionRecord
       return loadStorageMessages(locations.storageRoot, record.id);
     case 'legacy-json':
       return loadLegacyMessages(locations.dataRoot, record.id);
+    case 'event-log':
+      return loadEventMessages(locations.databasePath, record.id);
   }
 }
 
@@ -93,6 +105,12 @@ export async function deleteSession(locations: OpenCodeLocations, record: Sessio
 
   switch (record.source) {
     case 'sqlite':
+      await deleteSqliteSession(locations.databasePath, record.id);
+      return;
+    case 'event-log':
+      // The worker clears the event rows plus any stale legacy-table rows
+      // carrying the same id, so the session cannot resurface from an older
+      // generation after its events are gone.
       await deleteSqliteSession(locations.databasePath, record.id);
       return;
     case 'storage-json':
@@ -155,12 +173,21 @@ function readSqliteSessions(databasePath: string): ScanResult {
     // extension host for a very long time. Aggregating message counts once
     // via GROUP BY and joining that single result is the same information,
     // computed with one scan total instead of N.
+    // parent_id only exists on newer schemas — older databases (and the
+    // performance-guard fixtures, which mirror them) don't have the column,
+    // and selecting it unconditionally would fail the whole read.
+    const columnNames = handle
+      .prepare(`SELECT name FROM pragma_table_info('session')`)
+      .all()
+      .map((row) => String(row.name));
+    const hasParentId = columnNames.includes('parent_id');
     const rows = handle
       .prepare(
         `SELECT s.id           AS id,
                 s.title        AS title,
                 s.directory    AS directory,
                 s.project_id   AS project_id,
+                ${hasParentId ? 's.parent_id    AS parent_id,' : ''}
                 s.time_created AS time_created,
                 s.time_updated AS time_updated,
                 COALESCE(mc.message_count, 0) AS message_count
@@ -183,6 +210,7 @@ function readSqliteSessions(databasePath: string): ScanResult {
       updatedAt: toMillis(row.time_updated ?? row.time_created),
       messageCount: Number(row.message_count ?? 0),
       source: 'sqlite' as const,
+      ...(row.parent_id ? { parentId: String(row.parent_id) } : {}),
     }));
     return { sessions, warnings: [] };
   } catch (err) {
@@ -239,6 +267,163 @@ function loadSqliteMessages(databasePath: string, sessionId: string): SessionMes
       text: extractPartsText((partsByMessageId.get(String(row.id)) ?? []).join('\n')),
       createdAt: toMillis(row.time_created),
     }));
+  } catch {
+    return [];
+  } finally {
+    handle.close();
+  }
+}
+
+// ------------------------------------------------------------ event log ---
+
+/**
+ * Fourth (current) generation: OpenCode persists sessions as an event log
+ * (`event` table: `session.created.1` / `session.updated.1` /
+ * `message.updated.1` / `message.part.updated.1`) while the
+ * session/message/part row tables are left behind as stale data. Two full
+ * scans total (session events, then message counts), grouped in memory —
+ * the same discipline as the legacy readers. Per-session follow-ups lean on
+ * OpenCode's own (aggregate_id, type, seq) index instead of scanning.
+ */
+function readEventSessions(databasePath: string): ScanResult {
+  const handle = openDatabase(databasePath);
+  if ('error' in handle) {
+    return { sessions: [], warnings: handle.error ? [handle.error] : [] };
+  }
+
+  try {
+    const tableCount = Number(handle.prepare(
+      `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'event'`
+    ).all()[0]?.n ?? 0);
+    if (!tableCount) {
+      return { sessions: [], warnings: [] }; // Pre-event-log database: nothing to do here.
+    }
+
+    const sessionRows = handle
+      .prepare(
+        `SELECT aggregate_id AS id, type AS event_type, data
+           FROM event
+          WHERE type IN ('session.created.1', 'session.updated.1')
+          ORDER BY aggregate_id ASC, seq ASC`
+      )
+      .all();
+
+    const countRows = handle
+      .prepare(
+        `SELECT aggregate_id AS id, COUNT(*) AS message_count
+           FROM event
+          WHERE type = 'message.updated.1'
+          GROUP BY aggregate_id`
+      )
+      .all();
+    const counts = new Map<string, number>();
+    for (const row of countRows) {
+      counts.set(String(row.id), Number(row.message_count ?? 0));
+    }
+
+    const createdById = new Map<string, Record<string, unknown>>();
+    const updatedById = new Map<string, Record<string, unknown>>();
+    for (const row of sessionRows) {
+      const info = parseJson(row.data)?.info as Record<string, unknown> | undefined;
+      if (!info) {
+        continue;
+      }
+      const id = String(row.id);
+      if (String(row.event_type) === 'session.created.1') {
+        if (!createdById.has(id)) {
+          createdById.set(id, info);
+        }
+      } else {
+        updatedById.set(id, info); // Ordered by seq: the last one wins.
+      }
+    }
+
+    const sessions: SessionRecord[] = [];
+    for (const [id, created] of createdById) {
+      const updated = updatedById.get(id);
+      const primary = updated ?? created;
+      const title = String(primary.title ?? created.title ?? '') || `Session ${id.slice(0, 8)}`;
+      const parentId = created.parentID ?? updated?.parentID;
+      sessions.push({
+        id,
+        title,
+        directory: String(primary.directory ?? created.directory ?? ''),
+        projectId: String(primary.projectID ?? created.projectID ?? ''),
+        createdAt: toMillis(readTime(created, 'created')),
+        updatedAt: toMillis(
+          (updated && readTime(updated, 'updated')) || readTime(updated ?? {}, 'created') || readTime(created, 'updated') || readTime(created, 'created')
+        ),
+        messageCount: counts.get(id) ?? 0,
+        source: 'event-log',
+        ...(typeof parentId === 'string' && parentId ? { parentId } : {}),
+      });
+    }
+    return { sessions, warnings: [] };
+  } catch (err) {
+    return {
+      sessions: [],
+      warnings: [`Could not read the session event log: ${err instanceof Error ? err.message : String(err)}`],
+    };
+  } finally {
+    handle.close();
+  }
+}
+
+function loadEventMessages(databasePath: string, sessionId: string): SessionMessage[] {
+  const handle = openDatabase(databasePath);
+  if ('error' in handle) {
+    return [];
+  }
+
+  try {
+    const messageRows = handle
+      .prepare(
+        `SELECT data FROM event
+          WHERE aggregate_id = ? AND type = 'message.updated.1'
+          ORDER BY seq ASC`
+      )
+      .all(sessionId);
+
+    const partRows = handle
+      .prepare(
+        `SELECT data FROM event
+          WHERE aggregate_id = ? AND type = 'message.part.updated.1'
+          ORDER BY seq ASC`
+      )
+      .all(sessionId);
+    const textsByMessageId = new Map<string, string[]>();
+    for (const row of partRows) {
+      const part = parseJson(row.data)?.part as Record<string, unknown> | undefined;
+      if (!part || typeof part.messageID !== 'string') {
+        continue;
+      }
+      const text = extractText(part);
+      if (!text) {
+        continue;
+      }
+      const key = part.messageID;
+      const list = textsByMessageId.get(key);
+      if (list) {
+        list.push(text);
+      } else {
+        textsByMessageId.set(key, [text]);
+      }
+    }
+
+    const messages: SessionMessage[] = [];
+    for (const row of messageRows) {
+      const info = parseJson(row.data)?.info as Record<string, unknown> | undefined;
+      if (!info || typeof info.id !== 'string') {
+        continue;
+      }
+      messages.push({
+        id: info.id,
+        role: extractRole(info),
+        text: (textsByMessageId.get(info.id) ?? []).join('\n'),
+        createdAt: toMillis(readTime(info, 'created')),
+      });
+    }
+    return messages;
   } catch {
     return [];
   } finally {

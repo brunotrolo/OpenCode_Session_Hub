@@ -64,6 +64,7 @@ export class SyncController {
       includeOpencodeSkills: config.get<boolean>('includeOpencodeSkills', true),
       includeAgentsDir: config.get<boolean>('includeAgentsDir', true),
       redactSecrets: config.get<boolean>('redactSecrets', true),
+      includeChildSessions: config.get<boolean>('includeChildSessions', true),
       privateRepoAcknowledged: config.get<boolean>('privateRepoAcknowledged', false),
     };
   }

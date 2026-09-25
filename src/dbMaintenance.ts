@@ -203,9 +203,28 @@ let db;
 try {
   db = new DatabaseSync(databasePath);
   db.exec('PRAGMA busy_timeout = 5000;');
-  db.prepare('DELETE FROM part WHERE session_id = ?').run(sessionId);
-  db.prepare('DELETE FROM message WHERE session_id = ?').run(sessionId);
-  db.prepare('DELETE FROM session WHERE id = ?').run(sessionId);
+  // Event-log generation (newer OpenCode): explicit deletes, same as above
+  // — no reliance on ON DELETE CASCADE, which needs PRAGMA foreign_keys.
+  // Every table is guarded by existence: an event-only database has no
+  // part/message/session tables (and vice versa), and a missing table must
+  // skip, not fail the whole delete.
+  const hasTable = (name) =>
+    db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?").get(name).n > 0;
+  if (hasTable('part')) {
+    db.prepare('DELETE FROM part WHERE session_id = ?').run(sessionId);
+  }
+  if (hasTable('message')) {
+    db.prepare('DELETE FROM message WHERE session_id = ?').run(sessionId);
+  }
+  if (hasTable('session')) {
+    db.prepare('DELETE FROM session WHERE id = ?').run(sessionId);
+  }
+  if (hasTable('event')) {
+    db.prepare('DELETE FROM event WHERE aggregate_id = ?').run(sessionId);
+  }
+  if (hasTable('event_sequence')) {
+    db.prepare('DELETE FROM event_sequence WHERE aggregate_id = ?').run(sessionId);
+  }
 } catch (err) {
   result.ok = false;
   result.error = err && err.message ? err.message : String(err);

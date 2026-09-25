@@ -3,7 +3,7 @@ import { Dirent, createWriteStream } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { mergeManySessionDatabases, mergeSessionDatabases } from './dbMerge';
-import { exportSessionFilesOffThread, removeStrayExportTempFiles } from './favoriteSessionExport';
+import { exportSessionFilesOffThread, removeStrayExportTempFiles, truncateEventExport } from './favoriteSessionExport';
 import { loadDeletedSessions } from './deletedSessions';
 import { loadFavorites } from './favorites';
 import { checkGitHubRepoPrivacy } from './githubRepoVisibility';
@@ -24,6 +24,12 @@ export interface SyncSettings {
   includeOpencodeSkills: boolean;
   includeAgentsDir: boolean;
   redactSecrets: boolean;
+  /**
+   * Child sessions (forks, subagent runs) sync like any other session unless
+   * this is false. Optional so older callers constructing SyncSettings keep
+   * compiling; absent means ON.
+   */
+  includeChildSessions?: boolean;
   /** Fail-closed gate: secrets/sessions never sync until the user confirms the remote is private. */
   privateRepoAcknowledged: boolean;
 }
@@ -688,16 +694,18 @@ export class SyncManager {
     const messages: string[] = [];
     if (databaseSkipped) {
       // scanSessions already sorts newest-updated first.
-      const sqliteSessions = scanSessions(this.locations).sessions.filter((session) => session.source === 'sqlite');
-      for (const session of sqliteSessions.slice(0, MAX_INDIVIDUAL_SESSION_EXPORTS)) {
+      const scannable = scanSessions(this.locations).sessions.filter(
+        (session) => session.source === 'sqlite' || session.source === 'event-log'
+      );
+      for (const session of scannable.slice(0, MAX_INDIVIDUAL_SESSION_EXPORTS)) {
         if (!targets.has(session.id)) {
           targets.set(session.id, session.title);
         }
       }
-      if (sqliteSessions.length > MAX_INDIVIDUAL_SESSION_EXPORTS) {
+      if (scannable.length > MAX_INDIVIDUAL_SESSION_EXPORTS) {
         messages.push(
           'opencode.db could not be synced as a whole, so sessions are being synced individually — the ' +
-            `${MAX_INDIVIDUAL_SESSION_EXPORTS} most recently updated of ${sqliteSessions.length} were included. ` +
+            `${MAX_INDIVIDUAL_SESSION_EXPORTS} most recently updated of ${scannable.length} were included. ` +
             'Favorite any older session you want carried across; favorites are always synced regardless of this limit.'
         );
       }
@@ -735,6 +743,31 @@ export class SyncManager {
       return messages;
     }
 
+    // The same pass enforces includeChildSessions=false: fork/subagent
+    // children stay local while their parents keep syncing.
+    const scannedById = new Map(scanSessions(this.locations).sessions.map((s) => [s.id, s] as const));
+    if (this.settings.includeChildSessions === false) {
+      const childSkipped: string[] = [];
+      for (const [id, label] of [...targets]) {
+        if (scannedById.get(id)?.parentId) {
+          targets.delete(id);
+          childSkipped.push(`"${label}" (${id})`);
+        }
+      }
+      if (childSkipped.length > 0) {
+        messages.push(
+          `Skipped ${childSkipped.length} child session(s) (includeChildSessions is off): ` +
+            `${childSkipped.slice(0, 3).join(', ')}` +
+            `${childSkipped.length > 3 ? ` and ${childSkipped.length - 3} more` : ''}. ` +
+            'Their parents still synced.'
+        );
+      }
+    }
+
+    if (targets.size === 0) {
+      return messages;
+    }
+
     await fs.mkdir(destDir, { recursive: true });
 
     // Batched rather than one export call per session: OpenCode's schema has
@@ -744,7 +777,11 @@ export class SyncManager {
     // minutes. See exportSessionFilesBatched.
     const results = await exportSessionFilesOffThread(
       this.locations.databasePath,
-      [...targets.keys()].map((sessionId) => ({ sessionId, outputPath: path.join(destDir, `${sessionId}.db`) }))
+      [...targets.keys()].map((sessionId) => ({
+        sessionId,
+        outputPath: path.join(destDir, `${sessionId}.db`),
+        ...(scannedById.get(sessionId)?.source === 'event-log' ? { format: 'event' as const } : {}),
+      }))
     );
 
     for (const result of results) {
@@ -760,6 +797,22 @@ export class SyncManager {
       const outputPath = path.join(destDir, `${result.sessionId}.db`);
       const stat = await statOrNull(outputPath);
       if (stat && stat.size > OVERSIZED_FILE_SKIP_BYTES) {
+        // Event-format exports get a second chance: drop the oldest
+        // message/part events until the file fits, newest context first.
+        // A truncated session still merges and resumes anywhere a full one
+        // does — it just starts further into its own history.
+        if (scannedById.get(result.sessionId)?.source === 'event-log') {
+          const truncated = await truncateEventExport(outputPath, TRUNCATED_SESSION_BUDGET_BYTES);
+          const restat = await statOrNull(outputPath);
+          if (truncated.ok && restat && restat.size <= OVERSIZED_FILE_SKIP_BYTES) {
+            messages.push(
+              `Session "${label}" (${result.sessionId}) is too large to sync whole, so the oldest ` +
+                `${truncated.droppedMessages} message(s) were left out: the newest ${truncated.keptMessages} synced ` +
+                `(${(restat.size / (1024 * 1024)).toFixed(0)} MB). Shorten it to sync the full history.`
+            );
+            continue;
+          }
+        }
         await fs.rm(outputPath, { force: true });
         // Deliberately not checkOversizedFile()'s wording: that one tells
         // the user to compact opencode.db, which does nothing for a single
@@ -811,11 +864,25 @@ export class SyncManager {
     // A genuinely fresh machine has no opencode.db for the merge to write
     // into (mergeTable needs the target's tables to already exist), so the
     // first export bootstraps it by plain copy and the rest merge into that.
+    // Only a legacy-format file can bootstrap: an event-only file carries
+    // just event rows, and copying it as opencode.db would leave OpenCode
+    // with a database missing every other table it expects. With no legacy
+    // file and no local database there is nothing safe to build on — the
+    // synced sessions apply on a later pull, once OpenCode has created its
+    // database by running here.
     if (!(await exists(this.locations.databasePath))) {
+      const bootstrapIndex = sourcePaths.findIndex((sourcePath) => exportFileHasTable(sourcePath, 'session'));
+      if (bootstrapIndex === -1) {
+        messages.push(
+          'Synced sessions are waiting for a local database: OpenCode has not created opencode.db on this ' +
+            'machine yet. They will apply on a later pull, after OpenCode runs here once.'
+        );
+        return { count, messages };
+      }
       await fs.mkdir(path.dirname(this.locations.databasePath), { recursive: true });
-      await fs.copyFile(sourcePaths[0], this.locations.databasePath);
+      await fs.copyFile(sourcePaths[bootstrapIndex], this.locations.databasePath);
       count += 1;
-      sourcePaths.shift();
+      sourcePaths.splice(bootstrapIndex, 1);
       if (sourcePaths.length === 0) {
         return { count, messages };
       }
@@ -1497,6 +1564,14 @@ const MTIME_SAFETY_MARGIN_MS = 2000;
  */
 const OVERSIZED_FILE_SKIP_BYTES = 90 * 1024 * 1024;
 
+/**
+ * Target size when an event-format session export overshoots the skip
+ * limit: oldest message/part events are dropped newest-first until the file
+ * fits under this. Deliberately a hair under OVERSIZED_FILE_SKIP_BYTES so
+ * the truncated file always passes the check above on every filesystem.
+ */
+const TRUNCATED_SESSION_BUDGET_BYTES = 89 * 1024 * 1024;
+
 /** Where per-session favorite exports live in the mirror, one file per session id — see mirrorFavoriteSessions/applyFavoriteSessions. */
 const FAVORITE_SESSIONS_REPO_DIR = 'data/favorite-sessions';
 
@@ -1619,5 +1694,32 @@ async function readDirEntries(dir: string): Promise<Dirent[]> {
     return await fs.readdir(dir, { withFileTypes: true });
   } catch {
     return [];
+  }
+}
+
+/**
+ * Reads an export file's table list without fully opening it for merge.
+ * Without node:sqlite (or on an unreadable file) this answers true, which
+ * preserves the old bootstrap behavior instead of stranding a fresh machine.
+ */
+function exportFileHasTable(dbPath: string, table: string): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as {
+        n: number;
+      };
+      return Number(row?.n ?? 0) > 0;
+    } finally {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    return true;
   }
 }

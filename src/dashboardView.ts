@@ -25,6 +25,7 @@ type Inbound =
       includeSecrets: boolean;
       privateRepoAcknowledged: boolean;
       includeSessions: boolean;
+      includeChildSessions: boolean;
       redactSecrets: boolean;
     }
   | { type: 'previewSession'; id: string }
@@ -116,6 +117,11 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
             await this.controller.updateSetting('privateRepoAcknowledged', message.privateRepoAcknowledged);
           }
           await this.controller.updateSetting('includeSessions', message.includeSessions);
+          // Older callers post the four-field shape; only touch the child
+          // gate when the panel actually sent it.
+          if (typeof message.includeChildSessions === 'boolean') {
+            await this.controller.updateSetting('includeChildSessions', message.includeChildSessions);
+          }
           await this.controller.updateSetting('redactSecrets', message.redactSecrets);
           this.postState();
           return;
@@ -282,6 +288,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         updatedAt: s.updatedAt,
         createdAt: s.createdAt,
         messageCount: s.messageCount,
+        ...(s.parentId ? { parentId: s.parentId } : {}),
       })),
       sessionCount: sessions.length,
       favorites: this.controller.listFavorites(),
@@ -391,6 +398,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.75;
     margin-top: 3px; word-break: break-all;
   }
+  .fork-tag {
+    font-size: 10px; font-weight: 600; opacity: 0.75; border: 1px solid var(--vscode-panel-border);
+    border-radius: 8px; padding: 0 6px; flex: none;
+  }
   .mini-row { display: flex; gap: 6px; align-items: center; }
   .fav-id { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.7; word-break: break-all; margin: 3px 0 8px; }
   .warning-banner {
@@ -456,6 +467,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     <p class="desc">Session history only syncs while both boxes are checked.</p>
     <fieldset>
       <div class="checkbox-row"><input type="checkbox" id="includeSessions" /><label for="includeSessions">Sync session history<span class="hint">Message content leaves this machine.</span></label></div>
+      <div class="checkbox-row"><input type="checkbox" id="includeChildSessions" /><label for="includeChildSessions">Sync child sessions<span class="hint">Forks and subagent runs. Off keeps only top-level sessions.</span></label></div>
       <div class="checkbox-row"><input type="checkbox" id="includeSecrets" /><label for="includeSecrets">Allow secret-class data<span class="hint">Includes session content and credentials.</span></label></div>
       <div class="checkbox-row"><input type="checkbox" id="privateRepoAcknowledged" /><label for="privateRepoAcknowledged">My remote repo is PRIVATE<span class="hint">Confirm this before enabling secrets.</span></label></div>
       <div class="checkbox-row"><input type="checkbox" id="redactSecrets" /><label for="redactSecrets">Redact credentials<span class="hint">Replaces credential-shaped strings before syncing.</span></label></div>
@@ -573,6 +585,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     setChecked('autoPullOnStartup', schedule.autoPullOnStartup);
     setChecked('autoSyncOnFocusLost', schedule.autoSyncOnFocusLost);
     setChecked('includeSessions', settings.includeSessions);
+    setChecked('includeChildSessions', settings.includeChildSessions !== false);
     setChecked('includeSecrets', settings.includeSecrets);
     setChecked('privateRepoAcknowledged', settings.privateRepoAcknowledged);
     setChecked('redactSecrets', settings.redactSecrets);
@@ -596,7 +609,9 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
             (fav ? 'Remove from favorites' : 'Add to favorites') + '">' +
             (fav ? STAR_FILLED : STAR_OUTLINE) + '</button>' +
             '<button class="title-link" data-action="resume" data-id="' + escapeHtml(s.id) + '"' +
-            ' title="Resume in a terminal">' + escapeHtml(s.title) + '</button></div>' +
+            ' title="Resume in a terminal">' + escapeHtml(s.title) + '</button>' +
+            (s.parentId ? '<span class="fork-tag" title="Forked from session ' + escapeHtml(s.parentId) + '">fork</span>' : '') +
+            '</div>' +
             '<div class="meta-dir" title="' + escapeHtml(dir) + '">' + escapeHtml(dir) + '</div>' +
             '<div class="meta-line">' + escapeHtml(line) + '</div>' +
             '<div class="meta-id" title="' + escapeHtml(s.id) + '">Session ID ' + escapeHtml(s.id) + '</div>' +
@@ -686,6 +701,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       includeSecrets: $('includeSecrets').checked,
       privateRepoAcknowledged: $('privateRepoAcknowledged').checked,
       includeSessions: $('includeSessions').checked,
+      includeChildSessions: $('includeChildSessions').checked,
       redactSecrets: $('redactSecrets').checked,
     });
   });
